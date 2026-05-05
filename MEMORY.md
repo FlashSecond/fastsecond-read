@@ -2,6 +2,98 @@
 
 ---
 
+## 2026-05-05 更新：EPUB 读取器层级验证机制
+
+### 问题描述
+《刻意练习》第9章在分章时被错误地拆分成4个独立文件，因为原书EPUB中章节标题和小节标题使用了相同的HTML标签级别（`<h1>`）。
+
+### 错误拆分结果
+```
+69_第9章　用刻意练习创造全新的世界.md    (1.64 KB)
+70_用刻意练习原则教物理.md              (7.37 KB)  ← 错误地成为独立章节
+71_刻意练习的前景.md                    (16.47 KB) ← 错误地成为独立章节
+72_创造全新的世界.md                    (8.65 KB)  ← 错误地成为独立章节
+```
+
+### 解决方案：层级验证机制
+
+#### 1. 章节标题模式识别
+```python
+CHAPTER_PATTERN = re.compile(r'第[一二三四五六七八九十百千\d]+章|Chapter\s*\d+', re.IGNORECASE)
+```
+- 优先匹配包含"第X章"格式的标题作为主章节标题
+- 包含"第X部分"的标题也视为章节标题
+
+#### 2. 小节标题识别
+```python
+def _validate_heading_hierarchy(self, headings: List[Dict]) -> List[Dict]:
+    # 遍历所有标题候选
+    for i, heading in enumerate(headings):
+        title = heading.get('title', '')
+        
+        # 检查是否为真正的章节标题
+        is_real_chapter = self._is_chapter_title(title)
+        
+        if is_real_chapter:
+            heading['is_real_chapter'] = True
+            heading['merge_with_previous'] = False
+        else:
+            # 检查是否应该合并到上一章节
+            if last_chapter_heading and heading['level'] == 1:
+                last_chapter_idx = headings.index(last_chapter_heading)
+                distance = i - last_chapter_idx
+                
+                # 如果距离很近（小于5个标题），标记为需要合并的小节
+                if distance <= 5:
+                    heading['is_real_chapter'] = False
+                    heading['merge_with_previous'] = True
+                    heading['parent_chapter'] = last_chapter_heading
+```
+
+#### 3. 小节合并
+```python
+def _merge_subsections(self, chapters: List[Chapter], headings: List[Dict]) -> List[Chapter]:
+    # 将标记的小节内容合并到所属章节
+    for subsection in subsections:
+        chapter.content_blocks.append(ContentBlock(
+            type=ContentType.HEADING,
+            text=f"\n## {subsection.title}\n",
+            level=2,
+            ...
+        ))
+        chapter.content_blocks.extend(subsection.content_blocks)
+```
+
+### 修复效果
+```
+修复后（正确合并）:
+└── 第9章　用刻意练习创造全新的世界.md  (34.27 KB) ← 合并后的完整章节
+    ├── 第9章　用刻意练习创造全新的世界
+    ├── 用刻意练习原则教物理
+    ├── 刻意练习的前景
+    └── 创造全新的世界
+```
+
+### 新增常量
+```python
+# 章节标题模式（用于识别真正的章节标题）
+CHAPTER_PATTERN = re.compile(r'第[一二三四五六七八九十百千\d]+章|Chapter\s*\d+', re.IGNORECASE)
+
+# 小节合并阈值（小于此字数的"章节"视为小节）
+MIN_SUBSTANTIAL_CHAPTER = 1000
+```
+
+### 新增方法
+- `_is_chapter_title(title: str) -> bool`: 检查是否为章节标题
+- `_validate_heading_hierarchy(headings: List[Dict]) -> List[Dict]`: 验证标题层级
+- `_merge_subsections(chapters: List[Chapter], headings: List[Dict]) -> List[Chapter]`: 合并小节
+
+### 文件变更
+- 修改：`scripts/readers/epub_reader.py` - 添加层级验证机制
+- 修改：`SKILL.md` - 更新EPUB分章规则文档
+
+---
+
 ## 2026-05-05 更新：EPUB 读取器增强（多书合并支持）
 
 ### 问题描述

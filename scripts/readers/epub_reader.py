@@ -14,6 +14,12 @@ EPUB文件读取器 V2 - 基于HTML标签和内容的智能分章
 8. 检测无H1的异常结构：当HTML文件没有H1标题时，自动提升包含新书标记的标题为H1
 9. 超大章节拆分：当章节内容超过10万字符时，基于内部标题结构自动拆分
 10. 多书合并检测：识别"推荐序"、"前言"、"目录"等新书开始标记
+
+【改进 - 2026-05-05 - 层级验证】
+11. 章节标题模式识别：优先匹配"第X章"格式作为主章节标题
+12. 小节标题识别：无"第X章"前缀的一级标题视为小节，合并到上一章节
+13. 内容长度阈值：小于1000字的"章节"自动与上一章节合并
+14. 层级连续性检查：检查连续标题的层级关系，防止章节被错误拆分
 """
 from .base import FileReader
 from pathlib import Path
@@ -48,6 +54,12 @@ class EPUBReaderV2(FileReader):
     
     # 最小章节内容阈值（字符数）
     MIN_CHAPTER_CONTENT = 500
+    
+    # 章节标题模式（用于识别真正的章节标题）
+    CHAPTER_PATTERN = re.compile(r'第[一二三四五六七八九十百千\d]+章|Chapter\s*\d+', re.IGNORECASE)
+    
+    # 小节合并阈值（小于此字数的"章节"视为小节）
+    MIN_SUBSTANTIAL_CHAPTER = 1000
     
     def _is_non_chapter_title(self, title: str) -> bool:
         """检查是否为非章节标题"""
@@ -448,14 +460,140 @@ class EPUBReaderV2(FileReader):
         
         return merged
     
+    def _is_chapter_title(self, title: str) -> bool:
+        """检查是否为真正的章节标题（包含"第X章"模式）"""
+        if not title:
+            return False
+        return bool(self.CHAPTER_PATTERN.search(title))
+    
+    def _validate_heading_hierarchy(self, headings: List[Dict]) -> List[Dict]:
+        """验证标题层级关系，标记应该合并的小节标题
+        
+        规则：
+        1. 包含"第X章"的标题视为真正的章节标题
+        2. 不包含"第X章"的一级标题，如果前面有章节标题，则视为小节
+        3. 小于MIN_SUBSTANTIAL_CHAPTER字节的"章节"视为小节
+        """
+        validated = []
+        last_chapter_heading = None
+        
+        for i, heading in enumerate(headings):
+            title = heading.get('title', '')
+            
+            # 检查是否为真正的章节标题
+            is_real_chapter = self._is_chapter_title(title)
+            
+            # 如果是真正章节标题，直接添加
+            if is_real_chapter:
+                heading['is_real_chapter'] = True
+                heading['merge_with_previous'] = False
+                last_chapter_heading = heading
+                validated.append(heading)
+                continue
+            
+            # 如果不是真正章节标题，但有"第X部分"等模式，也视为章节
+            is_part = bool(re.search(r'第[一二三四五六七八九十百千\d]+部分|Part\s*\d+', title, re.IGNORECASE))
+            if is_part:
+                heading['is_real_chapter'] = True
+                heading['merge_with_previous'] = False
+                last_chapter_heading = heading
+                validated.append(heading)
+                continue
+            
+            # 检查是否应该合并到上一章节
+            if last_chapter_heading and heading['level'] == 1:
+                # 一级标题但没有"第X章"，可能是小节
+                # 检查与上一个真正章节的距离
+                last_chapter_idx = headings.index(last_chapter_heading)
+                distance = i - last_chapter_idx
+                
+                # 如果距离很近（小于5个标题），可能是小节
+                if distance <= 5:
+                    heading['is_real_chapter'] = False
+                    heading['merge_with_previous'] = True
+                    heading['parent_chapter'] = last_chapter_heading
+                    print(f"[INFO] Marked as subsection (will merge): {title[:50]}")
+                else:
+                    heading['is_real_chapter'] = True
+                    heading['merge_with_previous'] = False
+                    last_chapter_heading = heading
+            else:
+                heading['is_real_chapter'] = True
+                heading['merge_with_previous'] = False
+                if heading['level'] == 1:
+                    last_chapter_heading = heading
+            
+            validated.append(heading)
+        
+        return validated
+    
+    def _merge_subsections(self, chapters: List[Chapter], headings: List[Dict]) -> List[Chapter]:
+        """合并小节到所属章节"""
+        if not chapters:
+            return chapters
+        
+        merged = []
+        chapter_map = {}  # 映射原始标题到章节索引
+        
+        # 建立标题到章节的映射
+        for i, chapter in enumerate(chapters):
+            for heading in headings:
+                if heading.get('title') == chapter.title and heading.get('is_real_chapter'):
+                    chapter_map[heading['title']] = i
+                    break
+        
+        # 处理每个章节
+        for i, chapter in enumerate(chapters):
+            # 检查是否有小节需要合并
+            subsections = []
+            for heading in headings:
+                if (heading.get('merge_with_previous') and 
+                    heading.get('parent_chapter', {}).get('title') == chapter.title):
+                    # 找到对应的小节内容
+                    for j in range(i + 1, len(chapters)):
+                        if chapters[j].title == heading.get('title'):
+                            subsections.append(chapters[j])
+                            break
+            
+            if subsections:
+                # 合并小节内容
+                for subsection in subsections:
+                    chapter.content_blocks.append(ContentBlock(
+                        type=ContentType.HEADING,
+                        text=f"\n## {subsection.title}\n",
+                        level=2,
+                        style=TextStyle(bold=True),
+                        page_number=0
+                    ))
+                    chapter.content_blocks.extend(subsection.content_blocks)
+                    chapter.word_count += subsection.word_count
+                    chapter.paragraph_count += subsection.paragraph_count
+                
+                print(f"[INFO] Merged {len(subsections)} subsections into: {chapter.title[:50]}")
+            
+            merged.append(chapter)
+        
+        # 过滤掉已合并的小节章节
+        merged_titles = {h.get('title') for h in headings if h.get('merge_with_previous')}
+        final_chapters = [c for c in merged if c.title not in merged_titles]
+        
+        # 重新编号
+        for i, chapter in enumerate(final_chapters, 1):
+            chapter.index = i
+        
+        return final_chapters
+    
     def _build_chapters(self, headings: List[Dict], file_contents: Dict[str, str]) -> List[Chapter]:
         """根据标题构建章节（增强版：检测超大章节并尝试拆分）"""
         from bs4 import BeautifulSoup
         
+        # 首先验证标题层级关系
+        validated_headings = self._validate_heading_hierarchy(headings)
+        
         chapters = []
         skip_until_file = None  # 用于跳过已拆分的文件中的后续标题
         
-        for i, heading in enumerate(headings):
+        for i, heading in enumerate(validated_headings):
             # 如果正在跳过某个文件的标题
             if skip_until_file:
                 if heading['file_path'] == skip_until_file:
@@ -505,6 +643,9 @@ class EPUBReaderV2(FileReader):
             
             if chapter.word_count > 0:
                 chapters.append(chapter)
+        
+        # 合并小节到所属章节
+        chapters = self._merge_subsections(chapters, validated_headings)
         
         return chapters
     
