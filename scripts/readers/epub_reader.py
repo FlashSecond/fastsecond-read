@@ -1,5 +1,19 @@
 """
-EPUB文件读取器 - 基于EPUB目录结构的智能分章
+EPUB文件读取器 V2 - 基于HTML标签和内容的智能分章
+
+【规则 - 2026-05-02】
+1. 标题字数 < 50字
+2. 短文本检测
+3. 句末无句号
+4. 一级标题(h1)、二级标题(h2)、三级标题(h3-h6)
+5. 三级标题与正文同级
+6. 标题独立性：后面是否有正文
+7. 非独立标题合并（一级+二级合并）
+
+【改进 - 2026-05-05】
+8. 检测无H1的异常结构：当HTML文件没有H1标题时，自动提升包含新书标记的标题为H1
+9. 超大章节拆分：当章节内容超过10万字符时，基于内部标题结构自动拆分
+10. 多书合并检测：识别"推荐序"、"前言"、"目录"等新书开始标记
 """
 from .base import FileReader
 from pathlib import Path
@@ -8,32 +22,95 @@ from core.document import Document, Chapter, ContentBlock, ContentType, TextStyl
 import re
 
 
-def _info(msg: str):
-    """打印信息日志"""
-    print(f"[INFO] {msg}")
-
-
-def _debug(msg: str):
-    """打印调试日志"""
-    print(f"[DEBUG] {msg}")
-
-
-class EPUBReader(FileReader):
+class EPUBReaderV2(FileReader):
     """
-    EPUB文件读取器 - 基于目录结构的智能分章
+    EPUB文件读取器 V2
     
     核心逻辑：
-    1. 读取EPUB目录(toc.ncx/nav.xhtml)获取章节结构
-    2. 根据目录href提取各章节内容
-    3. 一级章节包含直到下一个一级章节之前的所有内容
-    4. 二级章节在一级章节内部，包含直到下一个二级章节之前的内容
+    1. 解析EPUB中的所有HTML文件
+    2. 使用h1/h2/h3-h6标签识别标题层级
+    3. 标题字数<50字、无句号、短文本
+    4. 判断标题独立性（后面是否有正文）
+    5. 非独立标题合并
     """
+    
+    # 非章节关键词（用于过滤）
+    NON_CHAPTER_KEYWORDS = [
+        '版权', '目录', 'contents', '赞誉', '推荐序', '译者序', '前言', '序言',
+        '致谢', '简介', '介绍', '导言', '引言', '后记', '附录', '参考文献',
+        '索引', '关于作者', '关于本书', '献词', '扉页', '封面'
+    ]
+    
+    # 新书开始标记关键词（用于检测多书合并的情况）
+    NEW_BOOK_INDICATORS = [
+        '推荐序', '译者序', '前言', '序言', '关于封面', '目录', 'contents'
+    ]
+    
+    # 最小章节内容阈值（字符数）
+    MIN_CHAPTER_CONTENT = 500
+    
+    def _is_non_chapter_title(self, title: str) -> bool:
+        """检查是否为非章节标题"""
+        if not title:
+            return True
+        title_lower = title.lower()
+        for keyword in self.NON_CHAPTER_KEYWORDS:
+            if keyword in title_lower:
+                return True
+        return False
     
     def supports(self, file_path: str) -> bool:
         return Path(file_path).suffix.lower() == '.epub'
     
-    def read(self, file_path: str) -> Document:
-        """读取EPUB文件并返回结构化文档"""
+    def _detect_new_book_in_content(self, content: str) -> Optional[str]:
+        """检测内容中是否包含新书开始的标志，返回可能的章节标题"""
+        from bs4 import BeautifulSoup
+        
+        soup = BeautifulSoup(content, 'html.parser')
+        
+        # 移除脚本和样式
+        for script in soup(["script", "style"]):
+            script.decompose()
+        
+        # 检查前几个元素
+        body = soup.find('body')
+        if not body:
+            return None
+        
+        for elem in body.children:
+            if not hasattr(elem, 'name') or not elem.name:
+                continue
+            
+            text = elem.get_text(strip=True)
+            if not text:
+                continue
+            
+            # 检查是否包含新书开始标记
+            for indicator in self.NEW_BOOK_INDICATORS:
+                if indicator in text and len(text) < 100:
+                    # 找到标记后的第一个实质性标题
+                    next_elem = elem.find_next_sibling()
+                    while next_elem:
+                        if hasattr(next_elem, 'name') and next_elem.name:
+                            next_text = next_elem.get_text(strip=True)
+                            if next_text and len(next_text) < 100:
+                                return next_text
+                        next_elem = next_elem.find_next_sibling()
+                    return text
+            
+            # 只检查前10个元素
+            break
+        
+        return None
+    
+    def read(self, file_path: str, level2_as_body: bool = True, level3_as_body: bool = True) -> Document:
+        """读取EPUB文件并返回结构化文档
+        
+        Args:
+            file_path: EPUB文件路径
+            level2_as_body: 是否将二级标题(h2)视为正文（默认True）
+            level3_as_body: 是否将三级标题(h3-h6)视为正文（默认True）
+        """
         file_info = self.get_file_info(file_path)
         
         try:
@@ -54,42 +131,47 @@ class EPUBReader(FileReader):
             doc.author = self._get_metadata(book, 'creator')
             doc.publisher = self._get_metadata(book, 'publisher')
             
-            # 第一步：读取EPUB目录获取章节结构
-            toc = self._extract_toc(book)
-            
-            # 第二步：构建文件内容映射
+            # 构建文件内容映射
             file_contents = self._build_file_contents_map(book)
             
-            # 第三步：根据目录结构创建章节
-            if toc:
-                # 使用目录结构
-                doc.chapters = self._build_chapters_from_toc(toc, file_contents)
-                
-                # 检查目录提取是否成功（章节数是否过少或内容是否过少）
-                if not self._validate_chapter_extraction(doc.chapters, file_contents):
-                    _info("目录提取可能不完整，切换到HTML标签分析模式...")
-                    html_chapters = self._extract_from_html_tags(file_contents)
-                    # 如果标签提取的章节更多或内容更多，使用标签提取的结果
-                    if len(html_chapters) > len(doc.chapters) or \
-                       sum(c.word_count for c in html_chapters) > sum(c.word_count for c in doc.chapters) * 1.2:
-                        _info(f"使用HTML标签提取: {len(html_chapters)}章 vs 目录提取: {len(doc.chapters)}章")
-                        doc.chapters = html_chapters
-            else:
-                # 回退到HTML标签分析
-                doc.chapters = self._extract_from_html_tags(file_contents)
+            # 提取所有标题候选
+            heading_candidates = self._extract_heading_candidates(file_contents)
             
+            # 过滤和分类标题
+            filtered_candidates = self._filter_headings(heading_candidates)
+            
+            # 标记二级、三级是否视为正文
+            for candidate in filtered_candidates:
+                level = candidate['level']
+                if level == 2:
+                    candidate['is_body'] = level2_as_body
+                elif level >= 3:
+                    candidate['is_body'] = level3_as_body
+                else:
+                    candidate['is_body'] = False
+            
+            # 检查标题独立性
+            independent_headings = self._check_independence(filtered_candidates)
+            
+            # 合并非独立标题
+            merged_headings = self._merge_headings(independent_headings)
+            
+            # 构建章节（过滤掉视为正文的标题）
+            doc.chapters = self._build_chapters(merged_headings, file_contents)
             doc.total_chapters = len(doc.chapters)
             doc.total_words = sum(c.word_count for c in doc.chapters)
+            
+            # 添加控制参数到元数据
+            doc.metadata['level2_as_body'] = level2_as_body
+            doc.metadata['level3_as_body'] = level3_as_body
             
             return doc
             
         except ImportError:
-            _info("ebooklib or beautifulsoup4 not installed. Please install: pip install ebooklib beautifulsoup4")
+            print("[INFO] ebooklib or beautifulsoup4 not installed")
             return self._create_empty_doc(file_info)
         except Exception as e:
-            _info(f"Error reading EPUB {file_path}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[INFO] Error reading EPUB {file_path}: {e}")
             return self._create_empty_doc(file_info)
     
     def _get_metadata(self, book, key: str) -> str:
@@ -102,121 +184,9 @@ class EPUBReader(FileReader):
             pass
         return None
     
-    def _extract_toc(self, book) -> List[Dict]:
-        """
-        从EPUB提取目录结构
-        
-        返回: [{'title': '章节名', 'href': '文件路径#锚点', 'level': 1}]
-        level映射（统一层级规则，h1和h2为同级章节）：
-        - level 1: 书籍名（字体大小 ≥ h1，仅标记边界）
-        - level 2/3: 章节标题（h1/h2同级）→ Chapter(level=1)
-        - level 4+: 小标题（h3-h6，作为正文内容块）
-        
-        同级章节规则：
-        - h1和h2为同级章节，各自独立
-        - 每个章节包含从当前章节开始，直到下一个章节之前的所有内容
-        - 小标题和正文归属于最近的章节
-        """
-        toc = []
-        
-        try:
-            # 尝试读取 toc.ncx (EPUB 2)
-            for item in book.get_items():
-                if item.get_name().endswith('.ncx'):
-                    toc = self._parse_ncx(item.get_content().decode('utf-8'))
-                    if toc:
-                        return toc
-        except:
-            pass
-        
-        try:
-            # 尝试读取 nav.xhtml (EPUB 3)
-            for item in book.get_items():
-                if item.get_name().endswith('nav.xhtml') or 'nav' in item.get_name().lower():
-                    toc = self._parse_nav_xhtml(item.get_content().decode('utf-8'))
-                    if toc:
-                        return toc
-        except:
-            pass
-        
-        return toc
-    
-    def _parse_ncx(self, content: str) -> List[Dict]:
-        """解析NCX目录文件"""
-        from bs4 import BeautifulSoup
-        
-        soup = BeautifulSoup(content, 'xml')
-        toc = []
-        
-        # 查找所有navPoint
-        for nav_point in soup.find_all('navPoint'):
-            title_elem = nav_point.find('text')
-            content_elem = nav_point.find('content')
-            
-            if title_elem and content_elem:
-                title = title_elem.get_text(strip=True)
-                href = content_elem.get('src', '')
-                
-                # 计算层级（根据navPoint嵌套深度）
-                level = 1
-                parent = nav_point.parent
-                while parent:
-                    if parent.name == 'navPoint':
-                        level += 1
-                    parent = parent.parent
-                
-                toc.append({
-                    'title': title,
-                    'href': href,
-                    'level': level
-                })
-        
-        return toc
-    
-    def _parse_nav_xhtml(self, content: str) -> List[Dict]:
-        """解析EPUB3导航文件"""
-        from bs4 import BeautifulSoup
-        
-        soup = BeautifulSoup(content, 'html.parser')
-        toc = []
-        
-        # 查找toc nav
-        nav = soup.find('nav', {'epub:type': 'toc'})
-        if not nav:
-            nav = soup.find('nav')
-        
-        if nav:
-            # 递归解析ol/li结构
-            def parse_list(ol, level=1):
-                items = []
-                for li in ol.find_all('li', recursive=False):
-                    a = li.find('a')
-                    if a:
-                        title = a.get_text(strip=True)
-                        href = a.get('href', '')
-                        items.append({
-                            'title': title,
-                            'href': href,
-                            'level': level
-                        })
-                    
-                    # 递归处理子列表
-                    sub_ol = li.find('ol', recursive=False)
-                    if sub_ol:
-                        items.extend(parse_list(sub_ol, level + 1))
-                
-                return items
-            
-            ol = nav.find('ol')
-            if ol:
-                toc = parse_list(ol)
-        
-        return toc
-    
     def _build_file_contents_map(self, book) -> Dict[str, str]:
         """构建文件路径到内容的映射"""
         import ebooklib
-        
         file_contents = {}
         
         for item in book.get_items():
@@ -230,524 +200,514 @@ class EPUBReader(FileReader):
         
         return file_contents
     
-    def _build_chapters_from_toc(self, toc: List[Dict], file_contents: Dict[str, str]) -> List[Chapter]:
-        """
-        根据目录结构创建章节（统一层级规则，h1和h2为同级）
+    def _is_non_chapter_title(self, title: str) -> bool:
+        """检查是否为非章节标题"""
+        if not title:
+            return True
+        title_lower = title.lower()
+        for keyword in self.NON_CHAPTER_KEYWORDS:
+            if keyword in title_lower:
+                return True
+        return False
+    
+    def _ends_with_period(self, text: str) -> bool:
+        """检查是否以句号结尾"""
+        return text.strip().endswith('。')
+    
+    def _extract_heading_candidates(self, file_contents: Dict[str, str]) -> List[Dict]:
+        """提取所有标题候选（增强版：检测无H1的异常结构）"""
+        from bs4 import BeautifulSoup
         
-        层级映射：
-        - level 1: 书籍名（字体大小 ≥ h1，仅标记边界，不创建章节）
-        - level 2/3: 章节标题（h1/h2同级）→ Chapter(level=1)
-        - level 4+: 小标题（h3-h6）→ 作为正文内容块，归属于最近的章节
+        candidates = []
+        sorted_files = sorted(file_contents.keys())
         
-        同级章节规则：
-        - h1和h2为同级章节，各自独立
-        - 每个章节包含从当前章节开始，到下一个章节之前的所有内容
-        - 小标题和正文归属于最近的章节
-        """
+        for file_idx, file_path in enumerate(sorted_files):
+            content = file_contents[file_path]
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # 移除脚本和样式
+            for script in soup(["script", "style"]):
+                script.decompose()
+            
+            # 找到所有h1-h6元素
+            headings_in_file = []
+            for elem in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                tag_name = elem.name.lower()
+                title = elem.get_text(strip=True)
+                
+                if not title:
+                    continue
+                
+                # 确定层级
+                if tag_name == 'h1':
+                    level = 1
+                elif tag_name == 'h2':
+                    level = 2
+                else:
+                    level = 3  # h3-h6作为三级标题
+                
+                headings_in_file.append({
+                    'file_path': file_path,
+                    'element': elem,
+                    'tag_name': tag_name,
+                    'title': title,
+                    'level': level,
+                    'position': elem.sourceline if hasattr(elem, 'sourceline') else 0
+                })
+            
+            # 检测无H1的异常结构
+            has_h1 = any(h['level'] == 1 for h in headings_in_file)
+            
+            if not has_h1 and headings_in_file:
+                # 检查是否包含新书开始标记
+                for h in headings_in_file:
+                    if any(indicator in h['title'] for indicator in self.NEW_BOOK_INDICATORS):
+                        # 将第一个包含新书标记的标题提升为H1
+                        h['level'] = 1
+                        h['tag_name'] = 'h1'
+                        h['is_promoted'] = True  # 标记为提升的标题
+                        print(f"[INFO] Promoted to H1 (new book indicator): {h['title'][:50]}")
+                        break
+                
+                # 如果没有新书标记，但全是H3及以下，检查内容量
+                all_low_level = all(h['level'] >= 3 for h in headings_in_file)
+                if all_low_level:
+                    # 提升第一个H3为H1（可能是新书的章节标题）
+                    first_h3 = next((h for h in headings_in_file if h['level'] == 3), None)
+                    if first_h3:
+                        first_h3['level'] = 1
+                        first_h3['tag_name'] = 'h1'
+                        first_h3['is_promoted'] = True
+                        print(f"[INFO] Promoted to H1 (no H1/H2, all H3+): {first_h3['title'][:50]}")
+            
+            candidates.extend(headings_in_file)
+        
+        # 按文件和位置排序
+        candidates.sort(key=lambda x: (x['file_path'], x['position']))
+        
+        return candidates
+    
+    def _filter_headings(self, candidates: List[Dict]) -> List[Dict]:
+        """过滤标题候选"""
+        filtered = []
+        
+        for candidate in candidates:
+            title = candidate['title']
+            
+            # 规则1: 字数 < 50
+            if len(title) >= 50:
+                continue
+            
+            # 规则2: 非章节关键词过滤
+            if self._is_non_chapter_title(title):
+                continue
+            
+            # 规则3: 不以句号结尾
+            if self._ends_with_period(title):
+                continue
+            
+            # 规则4: 短文本（已经通过字数<50控制）
+            
+            filtered.append(candidate)
+        
+        return filtered
+    
+    def _check_independence(self, candidates: List[Dict]) -> List[Dict]:
+        """检查每个标题后面是否有正文内容（改进：一级标题默认独立）"""
+        from bs4 import BeautifulSoup
+        
+        for i, candidate in enumerate(candidates):
+            level = candidate['level']
+            
+            # 一级标题默认独立（除非明确检测到后面没有内容）
+            if level == 1:
+                has_body = self._has_body_content_after(candidate, candidates, i)
+                candidate['has_body_after'] = has_body
+                # 一级标题只要有内容就独立，即使内容很少
+                candidate['is_independent'] = has_body or True  # 一级标题默认独立
+            else:
+                # 获取当前标题后的内容
+                has_body = self._has_body_content_after(candidate, candidates, i)
+                candidate['has_body_after'] = has_body
+                candidate['is_independent'] = has_body
+        
+        return candidates
+    
+    def _has_body_content_after(self, candidate: Dict, all_candidates: List[Dict], 
+                                current_idx: int) -> bool:
+        """检查当前标题后是否有正文内容"""
+        elem = candidate['element']
+        current_level = candidate['level']
+        
+        # 查找当前标题后的兄弟元素
+        next_sibling = elem.find_next_sibling()
+        
+        while next_sibling:
+            # 如果遇到另一个标题
+            if next_sibling.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                next_level = self._get_heading_level(next_sibling.name)
+                
+                # 规则: 一级/二级 + 三级 + 正文 → 三级视为正文
+                if next_level == 3 and current_level in [1, 2]:
+                    # 检查三级标题后面是否有正文
+                    sibling_after_h3 = next_sibling.find_next_sibling()
+                    while sibling_after_h3:
+                        if sibling_after_h3.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                            break
+                        text = sibling_after_h3.get_text(strip=True)
+                        if text and len(text) > 10:
+                            return True  # 三级标题后面有正文，当前标题独立
+                        sibling_after_h3 = sibling_after_h3.find_next_sibling()
+                    # 三级标题后面没有正文，继续检查
+                    next_sibling = next_sibling.find_next_sibling()
+                    continue
+                
+                # 如果是更低层级的标题（非三级特殊情况），不算正文
+                if next_level > current_level:
+                    return False
+                # 如果是同级或更高，停止检查
+                break
+            
+            # 检查是否有正文内容
+            text = next_sibling.get_text(strip=True)
+            if text and len(text) > 10:
+                return True
+            
+            next_sibling = next_sibling.find_next_sibling()
+        
+        return False
+    
+    def _get_heading_level(self, tag_name: str) -> int:
+        """获取标题层级"""
+        if tag_name == 'h1':
+            return 1
+        elif tag_name == 'h2':
+            return 2
+        else:
+            return 3
+    
+    def _merge_headings(self, candidates: List[Dict]) -> List[Dict]:
+        """合并非独立标题（保守策略：减少合并，保留更多独立章节）"""
+        if not candidates:
+            return []
+        
+        merged = []
+        i = 0
+        
+        while i < len(candidates):
+            current = candidates[i]
+            
+            # 规则1: 一级标题 + 二级标题（一级不独立，且二级有正文）→ 合并为章节名
+            # 但只有当它们在同一文件内且位置接近时才合并
+            if (current['level'] == 1 and 
+                not current.get('is_independent', False) and 
+                i + 1 < len(candidates)):
+                
+                next_candidate = candidates[i + 1]
+                # 检查是否在同一文件内
+                same_file = current['file_path'] == next_candidate['file_path']
+                
+                if next_candidate['level'] == 2 and same_file:
+                    # 合并标题，但保留二级标题作为独立小节
+                    merged_title = f"{current['title']} - {next_candidate['title']}"
+                    merged.append({
+                        'file_path': current['file_path'],
+                        'title': merged_title,
+                        'level': 1,
+                        'element': current['element'],
+                        'is_independent': True,
+                        'merged': True
+                    })
+                    i += 2
+                    continue
+            
+            # 规则2: 一级标题 + 一级标题（第一个不独立，且在同一文件）→ 合并
+            if (current['level'] == 1 and 
+                not current.get('is_independent', False) and 
+                i + 1 < len(candidates)):
+                
+                next_candidate = candidates[i + 1]
+                same_file = current['file_path'] == next_candidate['file_path']
+                
+                if next_candidate['level'] == 1 and same_file:
+                    # 合并两个一级标题
+                    merged_title = f"{current['title']} - {next_candidate['title']}"
+                    merged.append({
+                        'file_path': current['file_path'],
+                        'title': merged_title,
+                        'level': 1,
+                        'element': current['element'],
+                        'is_independent': True,
+                        'merged': True
+                    })
+                    i += 2
+                    continue
+            
+            merged.append(current)
+            i += 1
+        
+        return merged
+    
+    def _build_chapters(self, headings: List[Dict], file_contents: Dict[str, str]) -> List[Chapter]:
+        """根据标题构建章节（增强版：检测超大章节并尝试拆分）"""
         from bs4 import BeautifulSoup
         
         chapters = []
-        chapter_index = 0
+        skip_until_file = None  # 用于跳过已拆分的文件中的后续标题
         
-        for i, toc_item in enumerate(toc):
-            title = toc_item['title']
-            href = toc_item['href']
-            toc_level = toc_item.get('level', 1)
+        for i, heading in enumerate(headings):
+            # 如果正在跳过某个文件的标题
+            if skip_until_file:
+                if heading['file_path'] == skip_until_file:
+                    continue  # 跳过同一文件中的其他标题
+                else:
+                    skip_until_file = None  # 遇到新文件，恢复处理
             
-            # 解析href
-            if '#' in href:
-                file_path, anchor = href.split('#', 1)
-            else:
-                file_path, anchor = href, None
-            
-            # 获取文件内容
-            content = file_contents.get(file_path, '')
-            if not content:
+            if not heading.get('is_independent', False):
                 continue
             
-            # 提取章节内容（传递当前文件路径用于锚点判断）
-            chapter_content = self._extract_chapter_content(content, anchor, toc, i, file_path)
-            
-            # 检查内容是否为空
-            temp_soup = BeautifulSoup(chapter_content, 'html.parser')
-            text_content = temp_soup.get_text(strip=True)
-            
-            # 根据目录层级处理（统一层级规则：level 2/3 为同级章节）
-            if toc_level == 1:
-                # Level 1: 书籍名，仅标记边界，不创建章节
+            # 如果该标题视为正文，则不创建独立章节
+            if heading.get('is_body', False):
                 continue
             
-            elif toc_level in [2, 3]:
-                # Level 2/3: 章节标题（h1/h2同级）
-                if len(text_content) < 10:
-                    continue
-                
-                # h1和h2为同级，都使用 level=1
-                chapter = self._create_chapter_from_content(
-                    chapter_index, title, 1, chapter_content
-                )
-                chapters.append(chapter)
-                chapter_index += 1
+            # 提取章节内容
+            content_blocks = self._extract_chapter_content(heading, headings, i, file_contents)
             
-            else:
-                # Level 4+: 小标题（h3-h6），作为独立章节
-                if len(text_content) < 10:
-                    continue
+            if not content_blocks:
+                continue
+            
+            # 检查是否是超大章节（可能包含多本书的内容）
+            total_chars = sum(len(b.text) for b in content_blocks)
+            
+            if total_chars > 100000:  # 超过10万字符，可能是合并了多本书
+                print(f"[INFO] Large chapter detected: '{heading['title'][:50]}' ({total_chars} chars)")
                 
-                chapter = self._create_chapter_from_content(
-                    chapter_index, title, 1, chapter_content
-                )
+                # 尝试拆分超大章节
+                sub_chapters = self._split_large_chapter(heading, content_blocks)
+                
+                if sub_chapters:
+                    print(f"[INFO] Split into {len(sub_chapters)} sub-chapters")
+                    for sub_chapter in sub_chapters:
+                        sub_chapter.index = len(chapters) + 1
+                        chapters.append(sub_chapter)
+                    
+                    # 标记跳过该文件中的其他标题（因为内容已经被拆分处理）
+                    skip_until_file = heading['file_path']
+                    continue
+            
+            # 创建章节
+            chapter = self._create_chapter(
+                len(chapters) + 1,
+                heading['title'],
+                heading['level'],
+                content_blocks
+            )
+            
+            if chapter.word_count > 0:
                 chapters.append(chapter)
-                chapter_index += 1
         
         return chapters
     
-    def _extract_chapter_content(self, content: str, anchor: Optional[str], 
-                                  toc: List[Dict], toc_index: int,
-                                  current_file: str = None) -> str:
-        """提取章节内容
-        
-        内容范围规则：
-        - 从当前章节的锚点开始
-        - 到下一个同级或更高级别章节之前
-        - 如果下一个章节在不同文件，提取到当前文件末尾
-        """
+    def _split_large_chapter(self, heading: Dict, content_blocks: List[ContentBlock]) -> List[Chapter]:
+        """拆分超大章节（基于内部标题结构）"""
         from bs4 import BeautifulSoup
         
-        soup = BeautifulSoup(content, 'html.parser')
+        sub_chapters = []
+        current_blocks = []
+        current_title = heading['title']
         
-        # 移除脚本和样式
-        for script in soup(["script", "style"]):
-            script.decompose()
-        
-        if anchor:
-            # 如果有锚点，从锚点开始提取
-            start_elem = soup.find(id=anchor)
-            if start_elem:
-                return self._extract_from_element(start_elem, soup, toc, toc_index, current_file)
-        
-        # 没有锚点或找不到锚点，返回整个body内容
-        body = soup.find('body')
-        if body:
-            return str(body)
-        
-        return str(soup)
-    
-    def _extract_from_element(self, start_elem, soup, toc: List[Dict], 
-                              toc_index: int, current_file: str = None) -> str:
-        """从指定元素开始提取内容
-        
-        提取范围：
-        - 从 start_elem 开始
-        - 到下一个同级或更高级别的章节锚点之前
-        - 如果下一章节在不同文件，提取到当前文件末尾
-        """
-        content_parts = []
-        
-        # 收集所有元素
-        all_elements = list(soup.descendants)
-        
-        # 找到起始元素的位置
-        try:
-            start_idx = all_elements.index(start_elem)
-        except ValueError:
-            return str(start_elem)
-        
-        # 获取当前章节的层级
-        current_level = toc[toc_index].get('level', 2) if toc_index < len(toc) else 2
-        
-        # 查找下一个同级或更高级别章节的锚点（只在同一文件内）
-        stop_anchor = None
-        if toc_index + 1 < len(toc):
-            for next_idx in range(toc_index + 1, len(toc)):
-                next_item = toc[next_idx]
-                next_href = next_item['href']
-                next_level = next_item.get('level', 2)
-                next_file = next_href.split('#')[0] if '#' in next_href else next_href
+        for block in content_blocks:
+            # 检查是否是可能的子章节标题
+            if block.type == ContentType.HEADING:
+                # 检测新书开始的标志
+                is_new_book = any(indicator in block.text for indicator in self.NEW_BOOK_INDICATORS)
                 
-                # 只检查同一文件内的章节
-                if current_file and next_file != current_file:
+                # 检测"第X部分"、"第X章"等模式
+                is_part_chapter = bool(re.search(r'第[一二三四五六七八九十\d]+部分|第[一二三四五六七八九十\d]+章', block.text))
+                
+                # 检测"01 简单"这种编号章节
+                is_numbered_chapter = bool(re.search(r'^\d{2}\s+', block.text))
+                
+                if is_new_book or (is_part_chapter and len(current_blocks) > 10):
+                    # 保存当前子章节
+                    if current_blocks:
+                        sub_chapter = self._create_chapter(
+                            0,  # 索引稍后设置
+                            current_title,
+                            1,
+                            current_blocks
+                        )
+                        if sub_chapter.word_count > self.MIN_CHAPTER_CONTENT:
+                            sub_chapters.append(sub_chapter)
+                    
+                    # 开始新的子章节
+                    current_title = block.text
+                    current_blocks = []
                     continue
-                
-                # 找到同级或更高级别的章节
-                if next_level <= current_level:
-                    if '#' in next_href:
-                        _, stop_anchor = next_href.split('#', 1)
-                    break
-        
-        # 收集内容直到停止锚点
-        for elem in all_elements[start_idx:]:
-            # 跳过字符串节点
-            if not hasattr(elem, 'name') or not elem.name:
-                continue
             
-            # 检查是否到达停止锚点
-            if stop_anchor and elem.get('id') == stop_anchor:
-                break
-            
-            content_parts.append(str(elem))
+            current_blocks.append(block)
         
-        return '\n'.join(content_parts) if content_parts else str(start_elem)
+        # 保存最后一个子章节
+        if current_blocks:
+            sub_chapter = self._create_chapter(
+                0,
+                current_title,
+                1,
+                current_blocks
+            )
+            if sub_chapter.word_count > self.MIN_CHAPTER_CONTENT:
+                sub_chapters.append(sub_chapter)
+        
+        # 如果拆分后只有1个章节，说明拆分失败，返回空列表
+        if len(sub_chapters) <= 1:
+            return []
+        
+        return sub_chapters
     
-    def _create_chapter_from_content(self, index: int, title: str, level: int, 
-                                     content: str) -> Chapter:
-        """从HTML内容创建章节"""
+    def _extract_chapter_content(self, heading: Dict, all_headings: List[Dict],
+                                heading_idx: int, file_contents: Dict[str, str]) -> List[ContentBlock]:
+        """提取章节内容（支持跨文件提取）"""
         from bs4 import BeautifulSoup
         
-        soup = BeautifulSoup(content, 'html.parser')
-        
-        # 提取所有文本内容
-        text = soup.get_text(separator='\n', strip=True)
-        
-        # 检查是否有隐藏的h1/h2标签，优先使用其title属性
-        # 这用于处理class="hidden"的标题标签
-        enhanced_title = self._extract_hidden_title(soup, title)
-        
-        # 创建内容块 - 保持原有结构
-        content_blocks = self._extract_content_blocks(soup)
-        
-        # 计算字数（中文字符 + 英文单词）
-        word_count = self._count_words(text)
-        
-        return Chapter(
-            index=index,
-            title=enhanced_title,
-            level=level,
-            content_blocks=content_blocks,
-            word_count=word_count
-        )
-    
-    def _extract_hidden_title(self, soup, default_title: str) -> str:
-        """
-        提取章节标题（处理h1/h2标签）
-        
-        优先级：
-        1. 优先使用h1/h2标签的文本内容（如果存在且不为空）
-        2. 否则使用title属性（支持class="hidden"的h1/h2）
-        3. 最后使用默认标题（目录标题）
-        """
-        # 查找h1/h2标签
-        for tag_name in ['h1', 'h2']:
-            elem = soup.find(tag_name)
-            if elem:
-                # 优先使用标签文本（如果存在且不为空）
-                text_content = elem.get_text(strip=True)
-                if text_content:
-                    return text_content
-                
-                # 否则使用title属性
-                title_attr = elem.get('title')
-                if title_attr and title_attr.strip():
-                    return title_attr.strip()
-        
-        # 返回默认标题
-        return default_title
-    
-    def _extract_content_blocks(self, soup) -> List[ContentBlock]:
-        """提取内容块，保持HTML结构"""
         blocks = []
+        elem = heading['element']
+        current_file = heading['file_path']
+        current_level = heading['level']
         
-        for elem in soup.descendants:
-            if not hasattr(elem, 'name') or not elem.name:
-                continue
-            
-            block_type = self._get_block_type(elem)
-            if block_type:
-                text = elem.get_text(strip=True)
-                if text:
-                    style = self._extract_style(elem)
+        # 获取所有文件的有序列表
+        sorted_files = sorted(file_contents.keys())
+        current_file_idx = sorted_files.index(current_file)
+        
+        # 找到下一个同级或更高级标题的位置
+        next_heading_file = None
+        next_heading_elem = None
+        
+        for i in range(heading_idx + 1, len(all_headings)):
+            h = all_headings[i]
+            if h['level'] <= current_level and not h.get('is_body', False):
+                next_heading_file = h['file_path']
+                next_heading_elem = h['element']
+                break
+        
+        # 提取当前文件中的内容
+        next_sibling = elem.find_next_sibling()
+        while next_sibling:
+            # 如果遇到另一个标题
+            if next_sibling.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                next_level = self._get_heading_level(next_sibling.name)
+                # 如果是同级或更高级，停止当前文件的处理
+                if next_level <= current_level:
+                    break
+                # 如果是更低层级，作为小标题处理
+                else:
+                    title_text = next_sibling.get_text(strip=True)
                     blocks.append(ContentBlock(
-                        type=block_type,
-                        text=text,
-                        style=style
+                        type=ContentType.HEADING,
+                        text=title_text,
+                        level=next_level,
+                        style=TextStyle(bold=True),
+                        page_number=0
                     ))
+            else:
+                # 提取正文内容
+                text = next_sibling.get_text(strip=True)
+                if text:
+                    blocks.append(ContentBlock(
+                        type=ContentType.PARAGRAPH,
+                        text=text,
+                        level=0,
+                        style=TextStyle(),
+                        page_number=0
+                    ))
+            
+            next_sibling = next_sibling.find_next_sibling()
+        
+        # 如果下一个标题在不同的文件中，需要跨文件提取内容
+        if next_heading_file and next_heading_file != current_file:
+            next_file_idx = sorted_files.index(next_heading_file)
+            
+            # 提取中间文件的内容（不包括包含下一个标题的文件）
+            for file_idx in range(current_file_idx + 1, next_file_idx):
+                file_path = sorted_files[file_idx]
+                
+                # 检查这个文件是否有独立的H1标题（可能是新章节）
+                soup = BeautifulSoup(file_contents[file_path], 'html.parser')
+                has_h1 = bool(soup.find('h1'))
+                
+                # 如果文件有H1标题，停止提取（这是新章节）
+                if has_h1:
+                    break
+                
+                # 移除脚本和样式
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                
+                # 提取整个文件的内容
+                body = soup.find('body')
+                if body:
+                    for child in body.children:
+                        if hasattr(child, 'name') and child.name:
+                            self._extract_element_content(child, blocks, current_level)
         
         return blocks
     
-    def _get_block_type(self, elem) -> Optional[ContentType]:
-        """根据HTML标签判断内容块类型"""
-        tag = elem.name.lower()
-        
-        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            return ContentType.HEADING
-        elif tag == 'p':
-            return ContentType.PARAGRAPH
-        elif tag in ['ul', 'ol']:
-            return ContentType.LIST
-        elif tag == 'blockquote':
-            return ContentType.QUOTE
-        elif tag == 'pre' or tag == 'code':
-            return ContentType.CODE
-        elif tag == 'table':
-            return ContentType.TABLE
-        elif tag == 'img':
-            return ContentType.IMAGE
-        
-        return None
+    def _extract_element_content(self, elem, blocks: List[ContentBlock], current_level: int):
+        """提取单个元素的内容"""
+        # 如果是标题
+        if elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            level = self._get_heading_level(elem.name)
+            title_text = elem.get_text(strip=True)
+            if title_text:
+                blocks.append(ContentBlock(
+                    type=ContentType.HEADING,
+                    text=title_text,
+                    level=level,
+                    style=TextStyle(bold=True),
+                    page_number=0
+                ))
+        # 如果是段落或其他内容
+        elif elem.name in ['p', 'div', 'span', 'blockquote', 'li', 'td', 'th']:
+            text = elem.get_text(strip=True)
+            if text and len(text) > 5:  # 过滤太短的文本
+                blocks.append(ContentBlock(
+                    type=ContentType.PARAGRAPH,
+                    text=text,
+                    level=0,
+                    style=TextStyle(),
+                    page_number=0
+                ))
+        # 递归处理子元素
+        else:
+            for child in elem.children:
+                if hasattr(child, 'name') and child.name:
+                    self._extract_element_content(child, blocks, current_level)
     
-    def _extract_style(self, elem) -> TextStyle:
-        """提取文本样式"""
-        style = TextStyle()
+    def _create_chapter(self, index: int, title: str, level: int, 
+                       content_blocks: List[ContentBlock]) -> Chapter:
+        """创建章节对象"""
+        word_count = sum(len(b.text) for b in content_blocks)
+        paragraph_count = sum(1 for b in content_blocks if b.type == ContentType.PARAGRAPH)
         
-        # 检查标签类型
-        tag = elem.name.lower()
-        if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            style.heading_level = int(tag[1])
-        
-        # 检查样式类
-        class_list = elem.get('class', [])
-        if isinstance(class_list, str):
-            class_list = class_list.split()
-        
-        # 检查粗体
-        if tag in ['strong', 'b'] or 'bold' in class_list:
-            style.bold = True
-        
-        # 检查斜体
-        if tag in ['em', 'i'] or 'italic' in class_list:
-            style.italic = True
-        
-        return style
+        return Chapter(
+            index=index,
+            title=title[:100],
+            level=level,
+            content_blocks=content_blocks,
+            word_count=word_count,
+            paragraph_count=paragraph_count
+        )
     
-    def _count_words(self, text: str) -> int:
-        """计算字数"""
-        if not text:
-            return 0
-        
-        # 中文字符计数
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-        # 英文单词计数
-        english_words = len(re.findall(r'[a-zA-Z]+', text))
-        
-        return chinese_chars + english_words
-    
-    def _validate_chapter_extraction(self, chapters: List[Chapter], file_contents: Dict[str, str]) -> bool:
-        """
-        验证章节提取是否成功
-        
-        检查指标：
-        1. 章节数是否过少（少于文件中h1/h2标签数的50%）
-        2. 总内容字数是否过少（少于所有文件总文本的30%）
-        3. 是否存在大量空章节
-        
-        返回: True 如果提取看起来正常，False 如果可能有问题
-        """
-        from bs4 import BeautifulSoup
-        
-        if not chapters:
-            return False
-        
-        # 统计文件中的h1/h2标签数
-        total_headings = 0
-        total_text_length = 0
-        
-        for content in file_contents.values():
-            soup = BeautifulSoup(content, 'html.parser')
-            # 移除脚本和样式
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # 统计h1/h2标签
-            h1_count = len(soup.find_all('h1'))
-            h2_count = len(soup.find_all('h2'))
-            total_headings += h1_count + h2_count
-            
-            # 统计总文本长度
-            text = soup.get_text(strip=True)
-            total_text_length += len(text)
-        
-        # 检查1：章节数是否过少
-        extracted_chapters = len(chapters)
-        if total_headings > 0 and extracted_chapters < total_headings * 0.5:
-            print(f"章节数过少: 提取了{extracted_chapters}章，但检测到{total_headings}个h1/h2标签")
-            return False
-        
-        # 检查2：总字数是否过少
-        extracted_words = sum(c.word_count for c in chapters)
-        if total_text_length > 0 and extracted_words < total_text_length * 0.3:
-            print(f"内容字数过少: 提取了{extracted_words}字，但文件总文本约{total_text_length}字")
-            return False
-        
-        # 检查3：空章节比例
-        empty_chapters = sum(1 for c in chapters if c.word_count < 10)
-        if len(chapters) > 0 and empty_chapters / len(chapters) > 0.3:
-            print(f"空章节过多: {empty_chapters}/{len(chapters)}章内容少于10字")
-            return False
-        
-        return True
-    
-    def _extract_from_html_tags(self, file_contents: Dict[str, str]) -> List[Chapter]:
-        """
-        基于HTML标签(h1/h2)提取章节
-        
-        统一层级规则（h1和h2为同级章节）：
-        - h1和h2都作为一级章节边界
-        - 每个章节包含从当前h1/h2到下一个h1/h2之前的内容
-        """
-        from bs4 import BeautifulSoup
-        
-        chapters = []
-        chapter_index = 0
-        
-        for file_path, content in file_contents.items():
-            soup = BeautifulSoup(content, 'html.parser')
-            
-            # 移除脚本和样式
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # 收集所有元素
-            all_elements = list(soup.descendants)
-            
-            # 找到所有h1和h2元素作为同级章节边界
-            chapter_positions = []
-            for i, elem in enumerate(all_elements):
-                if hasattr(elem, 'name') and elem.name:
-                    tag_name = elem.name.lower()
-                    if tag_name in ['h1', 'h2']:
-                        chapter_positions.append((i, elem, tag_name))
-            
-            if not chapter_positions:
-                # 没有h1/h2，将整个文件作为一个章节
-                body = soup.find('body')
-                if body:
-                    chapter = self._create_chapter_from_content(
-                        chapter_index, file_path, 1, str(body)
-                    )
-                    if chapter.word_count > 0:
-                        chapters.append(chapter)
-                        chapter_index += 1
-                continue
-            
-            # 处理每个h1/h2作为同级章节
-            for idx, (start_pos, elem, tag_name) in enumerate(chapter_positions):
-                # 提取章节标题：优先使用标签文本，否则使用title属性
-                title = self._extract_chapter_title_from_elem(elem)
-                if not title:
-                    continue
-                
-                # 确定这个章节的内容范围（到下一个h1/h2之前）
-                if idx + 1 < len(chapter_positions):
-                    end_pos = chapter_positions[idx + 1][0]
-                else:
-                    end_pos = len(all_elements)
-                
-                # 提取章节内容
-                content_parts = []
-                for e in all_elements[start_pos:end_pos]:
-                    if hasattr(e, 'name') and e.name:
-                        content_parts.append(str(e))
-                
-                chapter_content = '\n'.join(content_parts)
-                
-                # 检查是否有正文内容（不只是标题）
-                temp_soup = BeautifulSoup(chapter_content, 'html.parser')
-                text = temp_soup.get_text(strip=True)
-                
-                # 移除标题后检查剩余内容
-                title_len = len(title)
-                remaining_text = text[title_len:].strip()
-                
-                # 过滤规则：中文字符≤3或英文单词<5
-                chinese_chars = len(__import__('re').findall(r'[\u4e00-\u9fff]', remaining_text))
-                english_words = len(__import__('re').findall(r'[a-zA-Z]+', remaining_text))
-                
-                if chinese_chars <= 3 and english_words < 5:
-                    # 没有正文内容，跳过此章节标签
-                    continue
-                
-                # 创建章节（h1和h2同级，都使用level=1）
-                chapter = self._create_chapter_from_content(
-                    chapter_index, title, 1, chapter_content
-                )
-                
-                if chapter.word_count > 0:
-                    chapters.append(chapter)
-                    chapter_index += 1
-        
-        return chapters
-    
-    def _extract_chapter_title_from_elem(self, elem) -> str:
-        """从h1/h2元素提取章节标题"""
-        # 优先使用标签文本
-        text_content = elem.get_text(strip=True)
-        if text_content:
-            return text_content
-        
-        # 否则使用title属性
-        title_attr = elem.get('title')
-        if title_attr and title_attr.strip():
-            return title_attr.strip()
-        
-        return None
-    
-    def _fallback_to_html_analysis(self, file_contents: Dict[str, str]) -> List[Chapter]:
-        """当目录不可用时，回退到HTML标签分析"""
-        from bs4 import BeautifulSoup
-        
-        chapters = []
-        chapter_index = 0
-        
-        for file_path, content in file_contents.items():
-            soup = BeautifulSoup(content, 'html.parser')
-            
-            # 移除脚本和样式
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # 查找所有h1标签作为一级章节
-            h1_elements = soup.find_all('h1')
-            
-            for h1 in h1_elements:
-                title = h1.get_text(strip=True)
-                if not title:
-                    continue
-                
-                # 提取从h1开始到下一个h1之前的内容
-                chapter_content = self._extract_until_next_heading(h1, soup, 'h1')
-                
-                chapter = self._create_chapter_from_content(
-                    chapter_index, title, 1, chapter_content
-                )
-                
-                if chapter.word_count > 0:
-                    chapters.append(chapter)
-                    chapter_index += 1
-        
-        return chapters
-    
-    def _extract_until_next_heading(self, start_elem, soup, heading_tag: str) -> str:
-        """提取从起始元素到下一个同级标题之前的内容"""
-        content_parts = []
-        
-        all_elements = list(soup.descendants)
-        
-        try:
-            start_idx = all_elements.index(start_elem)
-        except ValueError:
-            return str(start_elem)
-        
-        for elem in all_elements[start_idx:]:
-            if not hasattr(elem, 'name') or not elem.name:
-                continue
-            
-            # 如果遇到下一个同级标题，停止
-            if elem.name.lower() == heading_tag and elem != start_elem:
-                break
-            
-            content_parts.append(str(elem))
-        
-        return '\n'.join(content_parts) if content_parts else str(start_elem)
-    
-    def _create_empty_doc(self, file_info: dict) -> Document:
+    def _create_empty_doc(self, file_info: Dict) -> Document:
         """创建空文档"""
         return Document(
             file_path=file_info["path"],
             file_name=file_info["name"],
             file_format="epub",
-            title="",
-            author="",
             chapters=[],
             total_chapters=0,
             total_words=0
         )
+
+
+# 保持向后兼容
+EPUBReader = EPUBReaderV2

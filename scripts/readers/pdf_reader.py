@@ -1,422 +1,553 @@
+# -*- coding: utf-8 -*-
 """
-PDF文件读取器 - 输出JSON结构化文档
+PDF文件读取器 - 基于文本块属性的智能分章
+
+核心规则：
+1. 获取行宽度（页面内容区域）
+2. 统计频率最高的字号作为正文基准字号
+3. 提取文本块：内容、坐标(x0,y0,x1,y1)、字体名、字体大小
+
+标题层级判定（基于字号比例 + x0位置）：
+- 一级标题：字号≥1.4倍基准，x0远离正文(>10点)，垂直留白足够，短文本(<50字)，无句号
+- 二级标题：字号1.1-1.4倍，x0远离正文(>10点)，留白足够，短文本(<50字)，无句号
+- 三级标题：字号1.0-1.4倍，x0接近正文(≤10点)，留白足够，短文本(<40字)，无句号
+
+关键区分点：
+- 一级/二级/三级通过【字号比例】区分层级
+- 二级/三级通过【x0与正文位置关系】区分（远离vs接近）
+
+其他规则：
+- 留白检测：句前+句后留白 > 行宽一半，且垂直留白足够
+- 标签过滤：【章】【节】等标签不独立成章节
+- 合并规则：一级+二级无正文间隔时合并；标签与标题合并
+
+控制参数：
+- level2_as_body: 二级标题是否视为正文（默认True）
+- level3_as_body: 三级标题是否视为正文（默认True）
 """
 import re
-from .base import FileReader
+import fitz
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
+from collections import Counter
+
+from .base import FileReader
 from core.document import Document, Chapter, ContentBlock, ContentType, TextStyle
 
 
+@dataclass
+class TextBlock:
+    """文本块数据类"""
+    text: str
+    font_size: float
+    font_name: str
+    bbox: Tuple[float, float, float, float]  # x0, y0, x1, y1
+    page_num: int
+    page_width: float
+    page_height: float
+    ends_with_period: bool = False
+    
+    @property
+    def line_width(self) -> float:
+        return self.bbox[2] - self.bbox[0]
+
+
+@dataclass
+class HeadingInfo:
+    """标题信息"""
+    block: TextBlock
+    level: int  # 1, 2, 3
+    is_body: bool = False  # 是否视为正文
+    is_independent: bool = False
+    merged_title: str = ""
+
+
 class PDFReader(FileReader):
-    """PDF文件读取器 - 保留格式信息的结构化读取"""
+    """PDF文件读取器"""
     
     def supports(self, file_path: str) -> bool:
-        return Path(file_path).suffix.lower() == '.pdf'
+        """检查是否支持该文件类型"""
+        return file_path.lower().endswith('.pdf')
     
-    def read(self, file_path: str) -> Document:
-        """
-        读取PDF文件并返回结构化文档
+    # 标签模式（如【章】【节】等，这类标签不应该独立成章节）
+    LABEL_PATTERNS = [
+        r'^【[章节篇卷部]】$',
+        r'^\[[章节篇卷部]\]$',
+        r'^[（(][章节篇卷部][)）]$',
+    ]
+    
+    def _is_label(self, text: str) -> bool:
+        """检查文本是否为标签（如【章】【节】等）"""
+        text = text.strip()
+        for pattern in self.LABEL_PATTERNS:
+            if re.match(pattern, text):
+                return True
+        return False
+    
+    def _estimate_heading_level(self, font_ratio: float, text: str = "") -> int:
+        """根据字号比例和文本内容估算标题层级
         
-        提取内容的同时保留：
-        - 页面结构
-        - 字体样式（粗体、字号）
-        - 段落边界
-        - 标题层级
+        Args:
+            font_ratio: 字号与基准字号的比例
+            text: 文本内容（用于检测三级标题模式）
+            
+        Returns:
+            估算的标题层级 (1-3)
         """
-        file_info = self.get_file_info(file_path)
+        # 常规判断（不再使用三级标题模式匹配）
+        if font_ratio >= 1.4:
+            return 1  # 一级标题
+        elif font_ratio >= 1.1:
+            return 2  # 二级标题
+        elif font_ratio >= 1.0:
+            return 3  # 三级标题（上限改为1.4，与二级标题上限一致）
+        else:
+            return 2  # 默认二级
+    
+    def read(self, file_path: str, level2_as_body: bool = True, level3_as_body: bool = True) -> Document:
+        """读取PDF文件
         
-        try:
-            import pdfplumber
+        Args:
+            file_path: PDF文件路径
+            level2_as_body: 是否将二级标题视为正文（默认True）
+            level3_as_body: 是否将三级标题视为正文（默认True）
+        """
+        path = Path(file_path)
+        doc = fitz.open(file_path)
+        
+        # 提取所有文本块
+        blocks = self._extract_blocks(doc)
+        
+        # 计算基准字号
+        base_size = self._calculate_base_font_size(blocks)
+        
+        # 识别标题（每个标题会使用自己后面紧跟的正文x0来判断）
+        headings = self._identify_headings(blocks, base_size, level2_as_body=level2_as_body, level3_as_body=level3_as_body)
+        
+        # 判断独立性
+        headings = self._check_independence(headings, blocks, base_size)
+        
+        # 合并非独立标题
+        headings = self._merge_headings(headings)
+        
+        # 构建章节
+        chapters = self._build_chapters(headings, blocks, base_size)
+        
+        # 计算总字数
+        total_words = sum(ch.word_count for ch in chapters)
+        
+        return Document(
+            file_path=file_path,
+            file_name=path.name,
+            file_format="pdf",
+            title=path.stem,
+            chapters=chapters,
+            total_pages=len(doc),
+            total_words=total_words,
+            metadata={
+                "base_font_size": base_size,
+                "level2_as_body": level2_as_body,
+                "level3_as_body": level3_as_body
+            }
+        )
+    
+    def _extract_blocks(self, doc: fitz.Document) -> List[TextBlock]:
+        """提取所有文本块"""
+        blocks = []
+        
+        for page_num, page in enumerate(doc, 1):
+            text_dict = page.get_text("dict")
             
-            doc = Document(
-                file_path=file_info["path"],
-                file_name=file_info["name"],
-                file_format="pdf"
-            )
-            
-            all_content_blocks = []
-            current_chapter_blocks = []
-            chapter_index = 0
-            
-            with pdfplumber.open(file_path) as pdf:
-                doc.total_pages = len(pdf.pages)
+            for block in text_dict.get("blocks", []):
+                if "lines" not in block:
+                    continue
                 
-                for page_num, page in enumerate(pdf.pages, 1):
-                    # 提取带格式的文本
-                    words = page.extract_words(
-                        keep_blank_chars=True,
-                        x_tolerance=3,
-                        y_tolerance=3
-                    )
-                    
-                    if not words:
+                for line in block["lines"]:
+                    spans = line.get("spans", [])
+                    if not spans:
                         continue
                     
-                    # 按行分组
-                    lines = self._group_words_to_lines(words)
+                    # 合并同一行的所有span
+                    texts = []
+                    font_sizes = []
+                    bboxes = []
                     
-                    for line_info in lines:
-                        block = self._create_content_block(line_info, page_num)
-                        
-                        # 检测章节标题
-                        if self._is_chapter_title(block):
-                            # 保存上一个章节
-                            if current_chapter_blocks:
-                                chapter = self._create_chapter(
-                                    chapter_index, 
-                                    current_chapter_blocks
-                                )
-                                if chapter:
-                                    doc.chapters.append(chapter)
-                                    chapter_index += 1
-                            
-                            # 开始新章节
-                            current_chapter_blocks = [block]
-                        else:
-                            current_chapter_blocks.append(block)
-                        
-                        all_content_blocks.append(block)
-                
-                # 保存最后一个章节
-                if current_chapter_blocks:
-                    chapter = self._create_chapter(
-                        chapter_index, 
-                        current_chapter_blocks
-                    )
-                    if chapter:
-                        doc.chapters.append(chapter)
-            
-            # 如果没有检测到章节，将所有内容作为一个章节
-            if not doc.chapters and all_content_blocks:
-                doc.chapters.append(self._create_chapter(0, all_content_blocks))
-            
-            # 更新统计信息
-            doc.total_chapters = len(doc.chapters)
-            doc.total_words = sum(
-                len(block.text) 
-                for ch in doc.chapters 
-                for block in ch.content_blocks
-            )
-            
-            return doc
-            
-        except ImportError:
-            print("pdfplumber not installed, trying PyMuPDF...")
-            return self._read_with_pymupdf(file_path, file_info)
-        except Exception as e:
-            print(f"Error reading PDF {file_path}: {e}")
-            return self._create_empty_doc(file_info)
-    
-    def _read_with_pymupdf(self, file_path: str, file_info: dict) -> Document:
-        """使用PyMuPDF读取PDF"""
-        try:
-            import fitz
-            
-            doc = Document(
-                file_path=file_info["path"],
-                file_name=file_info["name"],
-                file_format="pdf"
-            )
-            
-            all_blocks = []
-            
-            with fitz.open(file_path) as pdf:
-                doc.total_pages = len(pdf)
-                
-                for page_num in range(len(pdf)):
-                    page = pdf[page_num]
-                    blocks = page.get_text("dict")["blocks"]
+                    for span in spans:
+                        text = span.get("text", "").strip()
+                        if text:
+                            texts.append(text)
+                            font_sizes.append(span.get("size", 12))
+                            bboxes.append(span["bbox"])
                     
-                    for block in blocks:
-                        if "lines" in block:
-                            for line in block["lines"]:
-                                for span in line["spans"]:
-                                    text = span["text"].strip()
-                                    if text:
-                                        content_block = ContentBlock(
-                                            type=ContentType.PARAGRAPH,
-                                            text=text,
-                                            style=TextStyle(
-                                                bold=span.get("flags", 0) & 2 ** 4 != 0,
-                                                font_size=span.get("size"),
-                                                font_name=span.get("font")
-                                            ),
-                                            page_number=page_num + 1,
-                                            bbox=(
-                                                block["bbox"][0],
-                                                block["bbox"][1],
-                                                block["bbox"][2],
-                                                block["bbox"][3]
-                                            )
-                                        )
-                                        all_blocks.append(content_block)
+                    if not texts:
+                        continue
+                    
+                    full_text = "".join(texts)
+                    if len(full_text) < 1:
+                        continue
+                    
+                    avg_font_size = sum(font_sizes) / len(font_sizes)
+                    x0 = min(b[0] for b in bboxes)
+                    y0 = min(b[1] for b in bboxes)
+                    x1 = max(b[2] for b in bboxes)
+                    y1 = max(b[3] for b in bboxes)
+                    
+                    blocks.append(TextBlock(
+                        text=full_text,
+                        font_size=avg_font_size,
+                        font_name=spans[0].get("font", ""),
+                        bbox=(x0, y0, x1, y1),
+                        page_num=page_num,
+                        page_width=page.rect.width,
+                        page_height=page.rect.height,
+                        ends_with_period=full_text.endswith('。')
+                    ))
+        
+        return blocks
+    
+    def _calculate_base_font_size(self, blocks: List[TextBlock]) -> float:
+        """计算正文基准字号（频率最高）"""
+        if not blocks:
+            return 12.0
+        
+        font_sizes = [round(b.font_size) for b in blocks]
+        size_counter = Counter(font_sizes)
+        most_common = size_counter.most_common(1)
+        return float(most_common[0][0]) if most_common else 12.0
+    
+    def _get_body_x0_after(self, blocks: List[TextBlock], start_idx: int, base_size: float) -> Optional[float]:
+        """获取指定位置之后紧跟的正文第一行的左边界x0"""
+        if not blocks or start_idx < 0 or start_idx >= len(blocks) or base_size <= 0:
+            return None
+        
+        # 从start_idx之后开始查找正文
+        for i in range(start_idx + 1, min(start_idx + 20, len(blocks))):
+            block = blocks[i]
+            font_ratio = block.font_size / base_size
+            # 字号接近基准（0.9-1.1倍）且长度足够视为正文
+            if 0.9 <= font_ratio <= 1.1 and len(block.text) > 10:
+                return block.bbox[0]
+        
+        return None
+    
+    def _identify_headings(self, blocks: List[TextBlock], base_size: float,
+                          level2_as_body: bool = True, level3_as_body: bool = True) -> List[HeadingInfo]:
+        """识别所有标题
+        
+        Args:
+            level2_as_body: 是否将二级标题视为正文（默认True）
+            level3_as_body: 是否将三级标题视为正文（默认True）
+        """
+        headings = []
+        
+        for i, block in enumerate(blocks):
+            prev_block = blocks[i-1] if i > 0 else None
+            next_block = blocks[i+1] if i < len(blocks) - 1 else None
             
-            # 章节检测和分组
-            doc.chapters = self._detect_chapters_from_blocks(all_blocks)
-            doc.total_chapters = len(doc.chapters)
-            doc.total_words = sum(
-                len(block.text) for block in all_blocks
-            )
+            # 获取该文本块后面紧跟的正文x0
+            body_x0 = self._get_body_x0_after(blocks, i, base_size)
             
-            return doc
-            
-        except ImportError:
-            print("PyMuPDF not installed. Please install: pip install pdfplumber PyMuPDF")
-            return self._create_empty_doc(file_info)
+            level = self._classify_block(block, base_size, body_x0, prev_block, next_block)
+            if level > 0:
+                # 根据控制参数决定是否视为正文
+                is_body = False
+                if level == 2 and level2_as_body:
+                    is_body = True
+                elif level == 3 and level3_as_body:
+                    is_body = True
+                
+                headings.append(HeadingInfo(block=block, level=level, is_body=is_body))
+        
+        return headings
     
-    def _group_words_to_lines(self, words: list) -> list:
-        """将单词按行分组"""
-        if not words:
-            return []
+    def _classify_block(self, block: TextBlock, base_size: float, 
+                       body_x0: Optional[float],
+                       prev_block: Optional[TextBlock] = None,
+                       next_block: Optional[TextBlock] = None) -> int:
+        """分类文本块，返回标题层级（0=正文，1=一级，2=二级，3=三级）"""
+        text = block.text.strip()
+        if len(text) < 2:
+            return 0
         
-        lines = []
-        current_line = [words[0]]
-        current_y = words[0].get("top", 0)
+        font_ratio = block.font_size / base_size if base_size > 0 else 1.0
+        no_period = not block.ends_with_period
         
-        for word in words[1:]:
-            word_y = word.get("top", 0)
-            # y坐标接近则认为是同一行
-            if abs(word_y - current_y) < 5:
-                current_line.append(word)
-            else:
-                lines.append(self._merge_words_to_line(current_line))
-                current_line = [word]
-                current_y = word_y
+        # 获取行宽
+        line_width = block.page_width
         
-        if current_line:
-            lines.append(self._merge_words_to_line(current_line))
+        # 检测留白
+        has_large_margin = self._has_large_margin(block, prev_block, next_block, line_width)
         
-        return lines
-    
-    def _merge_words_to_line(self, words: list) -> dict:
-        """合并单词为行信息"""
-        text = " ".join(w.get("text", "") for w in words)
+        # 判断一级标题：字号≥1.4 + 垂直留白足够 + 短文本 + 无句号 + x0远离正文
+        has_vertical_margin_only = self._has_vertical_margin_only(block, prev_block, next_block)
+        if font_ratio >= 1.4 and has_vertical_margin_only and len(text) < 50 and no_period:
+            if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
+                return 1
         
-        # 计算平均字体大小
-        sizes = [w.get("size", 12) for w in words if w.get("size")]
-        avg_size = sum(sizes) / len(sizes) if sizes else 12
+        # 判断二级标题：字号1.1-1.4 + 留白足够 + 短文本 + 无句号 + x0远离正文
+        if 1.1 <= font_ratio < 1.4 and has_large_margin and len(text) < 50 and no_period:
+            if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
+                return 2
         
-        # 检测粗体
-        is_bold = any(
-            w.get("fontname", "").lower().find("bold") >= 0 
-            for w in words
-        )
-        
-        return {
-            "text": text,
-            "size": avg_size,
-            "bold": is_bold,
-            "words": words
-        }
-    
-    def _create_content_block(self, line_info: dict, page_num: int) -> ContentBlock:
-        """创建内容块"""
-        text = line_info["text"].strip()
-        
-        # 检测内容类型
-        content_type = self._detect_content_type(text, line_info)
-        
-        # 检测标题层级
-        level = self._detect_heading_level(text, line_info)
-        
-        return ContentBlock(
-            type=content_type,
-            text=text,
-            level=level,
-            style=TextStyle(
-                bold=line_info.get("bold", False),
-                font_size=line_info.get("size")
-            ),
-            page_number=page_num
-        )
-    
-    def _detect_content_type(self, text: str, line_info: dict) -> ContentType:
-        """检测内容类型"""
-        # 代码块检测
-        if text.startswith("    ") or text.startswith("\t"):
-            return ContentType.CODE
-        
-        # 列表检测
-        if re.match(r'^[\s]*[•\-\*\d]+[\.\)]?[\s]', text):
-            return ContentType.LIST
-        
-        # 引用检测
-        if text.startswith(">") or text.startswith("「"):
-            return ContentType.QUOTE
-        
-        # 标题检测
-        if self._is_heading(text, line_info):
-            return ContentType.HEADING
-        
-        return ContentType.PARAGRAPH
-    
-    def _detect_heading_level(self, text: str, line_info: dict) -> int:
-        """检测标题层级"""
-        size = line_info.get("size", 12)
-        
-        # 根据字号判断层级
-        if size >= 18:
-            return 1
-        elif size >= 14:
-            return 2
-        elif size >= 12:
-            return 3
-        
-        # 根据格式判断
-        if re.match(r'^[第]?[\d一二三四五六七八九十]+[章节篇回]', text):
-            return 1
-        # 数字列表标题（如"1. 标题"、"01 标题"）
-        if re.match(r'^\d{1,3}[\.\、\s]+', text):
-            return 2
-        if re.match(r'^\d{2,3}\s+', text):
-            return 2
+        # 判断三级标题：字号1.0-1.4 + 留白足够 + 短文本 + 无句号 + x0接近正文
+        if 1.0 <= font_ratio < 1.4 and has_large_margin and len(text) < 40 and no_period:
+            if body_x0 and abs(block.bbox[0] - body_x0) <= 10:
+                return 3
         
         return 0
     
-    def _is_heading(self, text: str, line_info: dict) -> bool:
-        """判断是否为标题"""
-        size = line_info.get("size", 12)
-        is_bold = line_info.get("bold", False)
+    def _has_large_margin(self, block: TextBlock, prev_block: Optional[TextBlock], 
+                          next_block: Optional[TextBlock], line_width: float) -> bool:
+        """检测留白是否超过行宽的一半"""
+        block_width = block.bbox[2] - block.bbox[0]
+        total_margin = line_width - block_width
+        half_line_width = line_width * 0.5
         
-        # 字号较大或加粗
-        if size >= 14 or is_bold:
-            return True
+        # 检查句前+句末留白是否超过行宽的一半
+        has_horizontal_margin = total_margin > half_line_width
         
-        # 匹配标题格式
-        heading_patterns = [
-            r'^[第]?[\d一二三四五六七八九十]+[章节篇回]',
-            r'^[\d一二三四五六七八九十]+[、\.\s]',
-            r'^(?:摘要|前言|引言|结论|总结|附录)',
-            # 数字列表标题（更宽松）
-            r'^\d{1,3}[\.\、\s]+[\u4e00-\u9fa5]',  # 1. 中文
-            r'^\d{2,3}\s+[\u4e00-\u9fa5]',        # 01 中文
-        ]
+        # 检查句上句下留白
+        line_height = block.bbox[3] - block.bbox[1]
         
-        for pattern in heading_patterns:
-            if re.match(pattern, text):
+        margin_top = 0.0
+        margin_bottom = 0.0
+        
+        if prev_block and prev_block.page_num == block.page_num:
+            margin_top = block.bbox[1] - prev_block.bbox[3]
+        
+        if next_block and next_block.page_num == block.page_num:
+            margin_bottom = next_block.bbox[1] - block.bbox[3]
+        
+        has_vertical_margin = (margin_top > line_height) or (margin_bottom > line_height)
+        
+        return has_horizontal_margin and has_vertical_margin
+    
+    def _has_vertical_margin_only(self, block: TextBlock, prev_block: Optional[TextBlock], 
+                                   next_block: Optional[TextBlock]) -> bool:
+        """只检测垂直留白（用于一级标题）"""
+        line_height = block.bbox[3] - block.bbox[1]
+        
+        margin_top = 0.0
+        margin_bottom = 0.0
+        
+        if prev_block and prev_block.page_num == block.page_num:
+            margin_top = block.bbox[1] - prev_block.bbox[3]
+        
+        if next_block and next_block.page_num == block.page_num:
+            margin_bottom = next_block.bbox[1] - block.bbox[3]
+        
+        # 上方或下方留白超过行高
+        return (margin_top > line_height) or (margin_bottom > line_height)
+    
+    def _check_independence(self, headings: List[HeadingInfo], 
+                           blocks: List[TextBlock], base_size: float) -> List[HeadingInfo]:
+        """判断每个标题是否独立（后面是否有正文）"""
+        block_indices = {id(b): i for i, b in enumerate(blocks)}
+        
+        for i, heading in enumerate(headings):
+            block_idx = block_indices.get(id(heading.block), -1)
+            if block_idx < 0:
+                continue
+            
+            # 标签（如【章】【节】）不应该独立成章节
+            if self._is_label(heading.block.text):
+                heading.is_independent = False
+                continue
+            
+            heading.is_independent = self._has_body_after(
+                blocks, block_idx, headings, i, base_size
+            )
+        
+        return headings
+    
+    def _has_body_after(self, blocks: List[TextBlock], current_idx: int,
+                       headings: List[HeadingInfo], heading_idx: int, base_size: float) -> bool:
+        """检查当前位置之后是否有正文内容"""
+        current_heading = headings[heading_idx]
+        
+        for i in range(current_idx + 1, min(current_idx + 30, len(blocks))):
+            block = blocks[i]
+            
+            # 检查是否是另一个标题
+            is_other_heading = False
+            for h in headings:
+                if id(h.block) == id(block):
+                    is_other_heading = True
+                    
+                    # 规则15: 一级/二级 + 三级 + 正文 → 三级视为正文
+                    if h.level == 3 and current_heading.level in [1, 2]:
+                        # 检查三级标题后面是否有正文
+                        for j in range(i + 1, min(i + 10, len(blocks))):
+                            next_block = blocks[j]
+                            font_ratio = next_block.font_size / base_size if base_size > 0 else 1.0
+                            if 0.9 <= font_ratio <= 1.1 and len(next_block.text) > 10:
+                                return True
+                            # 检查是否遇到其他标题
+                            is_heading = False
+                            for hh in headings:
+                                if id(hh.block) == id(next_block):
+                                    is_heading = True
+                                    break
+                            if is_heading:
+                                break
+                        break
+                    
+                    # 如果是更低层级的标题，不算作正文
+                    if h.level > current_heading.level:
+                        return False
+                    break
+            
+            if is_other_heading:
+                continue
+            
+            # 检查是否为正文
+            font_ratio = block.font_size / base_size if base_size > 0 else 1.0
+            if 0.9 <= font_ratio <= 1.1 and len(block.text) > 10:
+                return True
+            if block.ends_with_period and len(block.text) > 5:
                 return True
         
         return False
     
-    def _is_chapter_title(self, block: ContentBlock) -> bool:
-        """判断是否为章节标题"""
-        text = block.text.strip()
+    def _merge_headings(self, headings: List[HeadingInfo]) -> List[HeadingInfo]:
+        """合并非独立标题"""
+        if not headings:
+            return []
         
-        # 一级标题检测（传统章节）
-        chapter_patterns = [
-            r'^[第][\d一二三四五六七八九十百千万]+[章节篇回]',
-            r'^Chapter\s+\d+',
-            r'^Part\s+\d+',
-        ]
+        merged = []
+        i = 0
         
-        for pattern in chapter_patterns:
-            if re.match(pattern, text, re.IGNORECASE):
-                return True
-        
-        # 数字列表标题检测（如"1. 思维模型名称"、"01 模型名称"）
-        number_patterns = [
-            r'^\d{1,3}[\.\、\s]+[\u4e00-\u9fa5]',  # 1. 中文标题、1、中文
-            r'^\d{2,3}\s+[\u4e00-\u9fa5]',        # 01 中文标题
-            r'^\d{1,3}\.[\s]*[A-Za-z]',          # 1. English
-        ]
-        
-        for pattern in number_patterns:
-            if re.match(pattern, text):
-                # 额外检查：数字列表标题通常较短，或者是粗体/较大字号
-                is_short = len(text) < 50
-                is_styled = block.type == ContentType.HEADING or block.style.bold or (block.style.font_size and block.style.font_size >= 12)
-                if is_short or is_styled:
-                    return True
-        
-        # 根据样式判断（粗体大字号的一级标题）
-        if block.type == ContentType.HEADING and block.level == 1 and block.style.bold:
-            return True
-        
-        return False
-    
-    def _create_chapter(self, index: int, blocks: list) -> Chapter:
-        """
-        从内容块创建章节
-        
-        章节过滤规则：
-        - 如果章节没有对应的正文内容（移除标题后字数≤3个中文字符或<5个英文单词），则跳过该章节
-        """
-        if not blocks:
-            return None
-        
-        # 第一个块作为标题（如果是标题类型）
-        title_block = blocks[0]
-        if title_block.type == ContentType.HEADING:
-            title = title_block.text
-            content_blocks = blocks[1:]
-        else:
-            title = f"章节 {index + 1}"
-            content_blocks = blocks
-        
-        # 计算统计信息
-        word_count = sum(len(block.text) for block in content_blocks)
-        paragraph_count = sum(
-            1 for block in content_blocks 
-            if block.type == ContentType.PARAGRAPH
-        )
-        
-        # 章节过滤：检查是否有足够的正文内容
-        all_content_text = ''.join(block.text for block in content_blocks)
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', all_content_text))
-        english_words = len(re.findall(r'[a-zA-Z]+', all_content_text))
-        
-        # 如果正文内容过少（≤3个中文字符或<5个英文单词），跳过该章节
-        if chinese_chars <= 3 and english_words < 5:
-            return None
-        
-        return Chapter(
-            index=index + 1,
-            title=title,
-            level=1,
-            content_blocks=content_blocks,
-            word_count=word_count,
-            paragraph_count=paragraph_count
-        )
-    
-    def _detect_chapters_from_blocks(self, blocks: list) -> list:
-        """从内容块列表中检测章节"""
-        chapters = []
-        current_chapter_blocks = []
-        chapter_index = 0
-        
-        for block in blocks:
-            if self._is_chapter_title(block):
-                # 保存上一个章节
-                if current_chapter_blocks:
-                    chapter = self._create_chapter(
-                        chapter_index, 
-                        current_chapter_blocks
-                    )
-                    if chapter:
-                        chapters.append(chapter)
-                        chapter_index += 1
+        while i < len(headings):
+            current = headings[i]
+            
+            # 规则12: 一级 + 任意下级标题（一级不独立）→ 合并
+            # 修改：支持一级与二级、三级等任意下级标题合并
+            if (current.level == 1 and 
+                not current.is_independent and 
+                i + 1 < len(headings)):
                 
-                # 开始新章节
-                current_chapter_blocks = [block]
-            else:
-                current_chapter_blocks.append(block)
+                next_heading = headings[i + 1]
+                # 只要下一个标题层级更高（数字更大），就合并
+                if next_heading.level > current.level:
+                    merged_title = f"{current.block.text} - {next_heading.block.text}"
+                    merged.append(HeadingInfo(
+                        block=current.block,
+                        level=1,
+                        is_independent=True,
+                        merged_title=merged_title
+                    ))
+                    i += 2
+                    continue
+            
+            # 规则14: 一级 + 一级（第一个不独立）→ 合并
+            if (current.level == 1 and 
+                not current.is_independent and 
+                i + 1 < len(headings)):
+                
+                next_heading = headings[i + 1]
+                if next_heading.level == 1:
+                    merged_title = f"{current.block.text} - {next_heading.block.text}"
+                    merged.append(HeadingInfo(
+                        block=current.block,
+                        level=1,
+                        is_independent=True,
+                        merged_title=merged_title
+                    ))
+                    i += 2
+                    continue
+            
+            merged.append(current)
+            i += 1
         
-        # 保存最后一个章节
-        if current_chapter_blocks:
-            chapter = self._create_chapter(chapter_index, current_chapter_blocks)
-            if chapter:
-                chapters.append(chapter)
+        return merged
+    
+    def _build_chapters(self, headings: List[HeadingInfo], 
+                       blocks: List[TextBlock], base_size: float) -> List[Chapter]:
+        """构建章节列表"""
+        if not headings:
+            return []
         
-        # 如果没有检测到章节，将所有内容作为一个章节
-        if not chapters and blocks:
-            chapters.append(self._create_chapter(0, blocks))
+        chapters = []
+        block_indices = {id(b): i for i, b in enumerate(blocks)}
+        
+        for i, heading in enumerate(headings):
+            if not heading.is_independent:
+                continue
+            
+            # 如果该标题视为正文，则不创建独立章节
+            if heading.is_body:
+                continue
+            
+            start_idx = block_indices.get(id(heading.block), -1)
+            if start_idx < 0:
+                continue
+            
+            # 查找章节结束位置（遇到下一个不视为正文的标题）
+            end_idx = len(blocks) - 1
+            for j in range(i + 1, len(headings)):
+                if not headings[j].is_body:
+                    next_idx = block_indices.get(id(headings[j].block), -1)
+                    if next_idx > 0:
+                        end_idx = next_idx - 1
+                    break
+            
+            # 提取章节内容
+            content_blocks = []
+            chapter_text = ""
+            
+            # 构建标题查找映射，用于判断内容块是否为标题及其层级
+            heading_block_ids = {id(h.block): h.level for h in headings}
+            
+            for j in range(start_idx, min(end_idx + 1, len(blocks))):
+                block = blocks[j]
+                
+                # 跳过标题本身（只保留文本）
+                if j == start_idx:
+                    chapter_text += block.text + "\n\n"
+                    continue
+                
+                # 判断是否为标题及其层级
+                block_id = id(block)
+                if block_id in heading_block_ids:
+                    # 这是一个标题，使用识别的层级
+                    heading_level = heading_block_ids[block_id]
+                    content_type = ContentType.HEADING
+                    content_level = heading_level
+                else:
+                    # 判断是否为正文
+                    font_ratio = block.font_size / base_size if base_size > 0 else 1.0
+                    is_body = (0.9 <= font_ratio <= 1.1) or block.ends_with_period
+                    
+                    if is_body:
+                        content_type = ContentType.PARAGRAPH
+                        content_level = 0
+                    else:
+                        # 可能是未识别的标题，根据字号和文本内容估算层级
+                        content_type = ContentType.HEADING
+                        content_level = self._estimate_heading_level(font_ratio, block.text)
+                
+                content_blocks.append(ContentBlock(
+                    type=content_type,
+                    text=block.text,
+                    level=content_level,
+                    style=TextStyle(
+                        font_size=block.font_size,
+                        bold=False
+                    )
+                ))
+                
+                chapter_text += block.text + "\n\n"
+            
+            title = heading.merged_title if heading.merged_title else heading.block.text
+            
+            chapters.append(Chapter(
+                index=len(chapters) + 1,
+                title=title,
+                level=heading.level,
+                content_blocks=content_blocks,
+                word_count=len(chapter_text.replace(" ", "").replace("\n", "")),
+                paragraph_count=len([b for b in content_blocks if b.type == ContentType.PARAGRAPH])
+            ))
         
         return chapters
-    
-    def _create_empty_doc(self, file_info: dict) -> Document:
-        """创建空文档"""
-        return Document(
-            file_path=file_info["path"],
-            file_name=file_info["name"],
-            file_format="pdf"
-        )

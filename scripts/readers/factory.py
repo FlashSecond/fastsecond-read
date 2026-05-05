@@ -6,7 +6,6 @@ from typing import List, Optional
 from core.document import Document
 from .base import FileReader
 from .pdf_reader import PDFReader
-from .pdf_reader_v2 import PDFReaderV2
 from .epub_reader import EPUBReader
 from .docx_reader import DocxReader
 from .txt_reader import TxtReader
@@ -35,8 +34,7 @@ class ReaderFactory:
     
     # 所有可用的读取器（按优先级排序）
     _readers: List[FileReader] = [
-        PDFReaderV2(),    # 优先使用 V2 版本（基于 PyMuPDF 的智能分章）
-        PDFReader(),      # 备选：pdfplumber 版本
+        PDFReader(),      # PDF 读取器（基于 PyMuPDF 的智能分章）
         EPUBReader(),
         DocxReader(),
         HTMLReader(),
@@ -69,33 +67,21 @@ class ReaderFactory:
         return None
     
     @classmethod
-    def read_file(cls, file_path: str, use_ocr: bool = False, use_v2: bool = True) -> Document:
+    def read_file(cls, file_path: str, use_ocr: bool = False) -> Document:
         """
         读取文件并返回结构化文档
-        
+
         Args:
             file_path: 文件路径
             use_ocr: 是否强制使用 OCR（用于图片版 PDF）
-            use_v2: 是否优先使用 PDF V2 读取器（基于版面特征的智能分章）
-            
+
         Returns:
             Document: 结构化文档对象
         """
         # 如果强制使用 OCR
         if use_ocr and file_path.lower().endswith('.pdf'):
             return cls._read_with_ocr(file_path)
-        
-        # 如果禁用 V2，使用 V1
-        if not use_v2 and file_path.lower().endswith('.pdf'):
-            reader = PDFReader()
-            doc = reader.read(file_path)
-            
-            # 自动检测：如果 PDF 内容太少，尝试 OCR
-            if doc.total_words < 1000 and not use_ocr:
-                _info(f"PDF 内容较少（{doc.total_words} 字），尝试 OCR 识别...")
-                return cls._read_with_ocr(file_path)
-            return doc
-        
+
         reader = cls.get_reader(file_path)
         
         if reader is None:

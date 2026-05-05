@@ -23,26 +23,37 @@ sys.path.insert(0, str(Path(__file__).parent))
 from readers.factory import ReaderFactory
 
 
-def format_chapter_content(doc_chapter, index: int) -> str:
+def format_chapter_content(doc_chapter, index: int, hierarchy_path: str = "") -> str:
     """
-    将章节内容格式化为美观的Markdown
+    将章节内容格式化为美观的Markdown，并在内容中标记一级、二级、三级标题
     
     Args:
         doc_chapter: 章节对象
         index: 章节序号
+        hierarchy_path: 层级路径（如 "1.2.3" 表示第1章第2节第3小节）
     
     Returns:
         格式化后的Markdown内容
     """
     title = doc_chapter.title or f"第{index}章"
+    level = doc_chapter.level
     
-    # 提取正文内容
+    # 根据层级确定标题前缀 (# ## ###)
+    heading_prefix = "#" * level
+    
+    # 层级标记符号
+    level_markers = {1: "【章】", 2: "【节】", 3: "【小节】"}
+    level_marker = level_markers.get(level, f"【层级{level}】")
+    
+    # 提取并标记正文内容中的标题层级
     content_parts = []
     for block in doc_chapter.content_blocks:
         if block.text:
             text = block.text.strip()
             if text:
-                content_parts.append(text)
+                # 根据内容块类型和层级添加标记
+                marked_text = _mark_heading_level(block, text)
+                content_parts.append(marked_text)
     
     content = '\n\n'.join(content_parts)
     word_count = len(content)
@@ -51,12 +62,13 @@ def format_chapter_content(doc_chapter, index: int) -> str:
     md_lines = []
     
     # 文档头部信息
-    md_lines.append(f"# {title}")
+    md_lines.append(f"{heading_prefix} {title}")
     md_lines.append("")
     md_lines.append("---")
     md_lines.append("")
     md_lines.append(f"**章节序号**：第{index}章  ")
-    md_lines.append(f"**章节层级**：{doc_chapter.level}  ")
+    md_lines.append(f"**章节层级**：{level} {level_marker}  ")
+    md_lines.append(f"**层级路径**：{hierarchy_path or str(index)}  ")
     md_lines.append(f"**字数统计**：{word_count} 字  ")
     md_lines.append(f"**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
     md_lines.append("")
@@ -114,16 +126,23 @@ def process_book(file_path: str, output_dir: Optional[str] = None) -> Dict:
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 保存每个章节
+    # 保存每个章节（支持层级结构）
     chapter_files = []
     
-    for idx, doc_chapter in enumerate(document.chapters, 1):
+    def process_chapter(chapter, index: int, parent_path: str = "") -> str:
+        """递归处理章节，返回层级路径"""
+        # 构建层级路径
+        if parent_path:
+            hierarchy_path = f"{parent_path}.{index}"
+        else:
+            hierarchy_path = str(index)
+        
         # 格式化章节内容为Markdown
-        md_content = format_chapter_content(doc_chapter, idx)
+        md_content = format_chapter_content(chapter, index, hierarchy_path)
         
         # 保存MD文件
-        safe_title = _sanitize_filename(doc_chapter.title or f"chapter_{idx}")
-        filename = f"{idx:02d}_{safe_title}.md"
+        safe_title = _sanitize_filename(chapter.title or f"chapter_{index}")
+        filename = f"{hierarchy_path.replace('.', '_')}_{safe_title}.md"
         filepath = output_dir / filename
         
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -133,7 +152,26 @@ def process_book(file_path: str, output_dir: Optional[str] = None) -> Dict:
         
         # 统计字数
         word_count = len([c for c in md_content if '\u4e00' <= c <= '\u9fff']) + len(md_content.split())
-        print(f"[INFO] 保存章节 {idx}: {doc_chapter.title[:40]}... ({word_count} 字)")
+        safe_title = chapter.title[:40].replace('\xa0', ' ').replace('\u3000', ' ')
+        # 安全编码处理
+        try:
+            safe_title_display = safe_title.encode('gbk', errors='ignore').decode('gbk')
+        except:
+            safe_title_display = f"Chapter_{index}"
+        
+        level_marker = {1: "【章】", 2: "【节】", 3: "【小节】"}.get(chapter.level, "")
+        print(f"[INFO] 保存 {level_marker} {hierarchy_path}: {safe_title_display}... ({word_count} 字)")
+        
+        # 递归处理子章节
+        if hasattr(chapter, 'sub_chapters') and chapter.sub_chapters:
+            for sub_idx, sub_chapter in enumerate(chapter.sub_chapters, 1):
+                process_chapter(sub_chapter, sub_idx, hierarchy_path)
+        
+        return hierarchy_path
+    
+    # 处理所有顶级章节
+    for idx, doc_chapter in enumerate(document.chapters, 1):
+        process_chapter(doc_chapter, idx)
     
     print(f"\n[INFO] 分章完成!")
     print(f"  章节数: {len(document.chapters)}")
@@ -147,6 +185,34 @@ def process_book(file_path: str, output_dir: Optional[str] = None) -> Dict:
         'output_dir': str(output_dir),
         'chapter_files': chapter_files
     }
+
+
+def _mark_heading_level(block, text: str) -> str:
+    """
+    根据内容块类型标记标题层级，使用 # 标记
+    
+    Args:
+        block: 内容块对象
+        text: 文本内容
+    
+    Returns:
+        带层级标记的文本（使用 # ## ### 格式）
+    """
+    from core.document import ContentType
+    
+    # 如果是标题类型，根据层级添加 # 标记
+    if block.type == ContentType.TITLE or block.type == ContentType.HEADING:
+        level = block.level
+        # 限制 level 在 1-6 范围内
+        if level < 1:
+            level = 1
+        if level > 6:
+            level = 6
+        # 使用 # 标记，例如：## 二级标题
+        prefix = "#" * level
+        return f"{prefix} {text}"
+    
+    return text
 
 
 def _sanitize_filename(name: str) -> str:
