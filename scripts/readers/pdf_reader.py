@@ -1,24 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-PDF文件读取器 - 基于文本块属性的智能分章
+PDF文件读取器 - 基于字号统计的智能分章
 
 核心规则：
 1. 获取行宽度（页面内容区域）
 2. 统计频率最高的字号作为正文基准字号
 3. 提取文本块：内容、坐标(x0,y0,x1,y1)、字体名、字体大小
 
-标题层级判定（基于字号比例 + x0位置）：
-- 一级标题：字号≥1.4倍基准，x0远离正文(>10点)，垂直留白足够，短文本(<50字)，无句号
-- 二级标题：字号1.1-1.4倍，x0远离正文(>10点)，留白足够，短文本(<50字)，无句号
-- 三级标题：字号1.0-1.4倍，x0接近正文(≤10点)，留白足够，短文本(<40字)，无句号
+标题层级判定（基于字号统计阈值）：
+1. 收集所有可能的标题候选（字号>=基准）
+2. 统计候选标题的字号，去重
+3. 不放回取两次最大值：
+   - 第一个最大值 = 一级标题字号阈值
+   - 第二个最大值 = 二级标题字号阈值
+4. 根据阈值重新分类标题：
+   - 一级标题：字号 >= 一级阈值 + 垂直留白足够 + 短文本(<50字) + 无句号 + (居中 或 x0远离正文)
+   - 二级标题：字号 >= 二级阈值 且 < 一级阈值 + 留白足够 + 短文本(<50字) + 无句号 + x0远离正文
+   - 三级标题：字号 >= 基准 且 < 二级阈值 + 留白足够 + 短文本(<40字) + 无句号 + x0接近正文
 
 关键区分点：
-- 一级/二级/三级通过【字号比例】区分层级
-- 二级/三级通过【x0与正文位置关系】区分（远离vs接近）
+- 一级/二级通过【字号绝对阈值】区分
+- 二级/三级通过【字号绝对阈值 + x0位置】区分
 
 其他规则：
 - 留白检测：句前+句后留白 > 行宽一半，且垂直留白足够
 - 标签过滤：【章】【节】等标签不独立成章节
+- 页眉页脚过滤：短文本(<30字)在页面顶部/底部6%区域内视为非标题
 - 合并规则：一级+二级无正文间隔时合并；标签与标题合并
 
 控制参数：
@@ -66,6 +73,9 @@ class HeadingInfo:
 class PDFReader(FileReader):
     """PDF文件读取器"""
     
+    # 页眉页脚位置阈值（距离页面顶部/底部的距离比例）
+    HEADER_FOOTER_MARGIN_RATIO = 0.06  # 页面高度的6%以内视为页眉页脚区域
+    
     def supports(self, file_path: str) -> bool:
         """检查是否支持该文件类型"""
         return file_path.lower().endswith('.pdf')
@@ -77,6 +87,8 @@ class PDFReader(FileReader):
         r'^[（(][章节篇卷部][)）]$',
     ]
     
+
+    
     def _is_label(self, text: str) -> bool:
         """检查文本是否为标签（如【章】【节】等）"""
         text = text.strip()
@@ -84,6 +96,226 @@ class PDFReader(FileReader):
             if re.match(pattern, text):
                 return True
         return False
+    
+    # 注释章节标题模式
+    NOTE_PATTERNS = [
+        r'^注释\s*[-—–]',
+        r'^注释\s*[:：]',
+        r'^Notes?$',
+        r'^注释$',
+        r'^注\s*\d+',
+        r'^\d+\s*注释',
+    ]
+    
+    def _is_note_heading(self, text: str) -> bool:
+        """检查文本是否为注释章节标题"""
+        text = text.strip()
+        for pattern in self.NOTE_PATTERNS:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    def _is_in_header_footer_area(self, block: TextBlock) -> bool:
+        """检查文本块是否在页眉或页脚区域
+        
+        根据文本块的垂直位置判断是否在页眉（页面顶部）或页脚（页面底部）区域
+        """
+        page_height = block.page_height
+        y0 = block.bbox[1]  # 上边界
+        y1 = block.bbox[3]  # 下边界
+        
+        # 计算文本块中心位置
+        center_y = (y0 + y1) / 2
+        
+        # 页眉区域：页面顶部6%以内
+        header_threshold = page_height * self.HEADER_FOOTER_MARGIN_RATIO
+        # 页脚区域：页面底部6%以内
+        footer_threshold = page_height * (1 - self.HEADER_FOOTER_MARGIN_RATIO)
+        
+        return center_y < header_threshold or center_y > footer_threshold
+    
+    def _collect_heading_candidates(self, blocks: List[TextBlock], base_size: float) -> List[Tuple[TextBlock, float]]:
+        """收集所有可能的标题候选（基于基本启发式规则）
+        
+        返回: [(block, font_ratio), ...]
+        """
+        candidates = []
+        
+        for i, block in enumerate(blocks):
+            prev_block = blocks[i-1] if i > 0 else None
+            next_block = blocks[i+1] if i < len(blocks) - 1 else None
+            
+            # 基本过滤：长度、位置
+            text = block.text.strip()
+            if len(text) < 2 or len(text) > 50:  # 标题通常较短
+                continue
+            
+            # 页眉页脚区域过滤
+            if len(text) < 30 and self._is_in_header_footer_area(block):
+                continue
+            
+            # 标签过滤
+            if self._is_label(text):
+                continue
+            
+            # 句号过滤：标题通常不以句号结尾
+            if block.ends_with_period:
+                continue
+            
+            # 计算字号比例
+            font_ratio = block.font_size / base_size if base_size > 0 else 1.0
+            
+            # 只收集字号明显大于正文的候选（至少1.1倍）
+            if font_ratio < 1.1:
+                continue
+            
+            # 留白检测：标题通常有足够的留白
+            line_width = block.page_width
+            has_margin = self._has_large_margin(block, prev_block, next_block, line_width)
+            if not has_margin:
+                continue
+            
+            candidates.append((block, font_ratio))
+        
+        return candidates
+    
+    def _calculate_heading_thresholds(self, candidates: List[Tuple[TextBlock, float]], base_size: float) -> Tuple[float, float]:
+        """计算一级和二级标题的字号阈值
+        
+        规则：
+        1. 统计所有候选标题的字号，按字号分组统计出现频率
+        2. 过滤掉出现频率过低的字号（可能是广告/噪音）
+        3. 不放回取两次最大值
+        4. 第一个最大值 = 一级标题字号
+        5. 第二个最大值 = 二级标题字号
+        
+        返回: (level1_threshold, level2_threshold)
+        """
+        if not candidates:
+            # 默认值：一级1.5倍，二级1.2倍
+            return base_size * 1.5, base_size * 1.2
+        
+        # 按字号分组统计出现频率（保留1位小数）
+        from collections import Counter
+        size_counter = Counter()
+        for block, ratio in candidates:
+            size_rounded = round(block.font_size, 1)
+            size_counter[size_rounded] += 1
+        
+        # 过滤掉出现频率过低的字号（少于2次的可能是广告/噪音）
+        min_frequency = 2
+        filtered_sizes = [(size, count) for size, count in size_counter.items() if count >= min_frequency]
+        
+        if not filtered_sizes:
+            # 如果没有满足频率要求的，使用原始逻辑
+            font_sizes = set(round(block.font_size, 1) for block, ratio in candidates)
+            filtered_sizes = [(size, 1) for size in font_sizes]
+        
+        # 按字号降序排序
+        filtered_sizes.sort(key=lambda x: x[0], reverse=True)
+        
+        if len(filtered_sizes) == 0:
+            return base_size * 1.5, base_size * 1.2
+        elif len(filtered_sizes) == 1:
+            # 只有一个字号级别
+            return filtered_sizes[0][0], base_size * 1.2
+        else:
+            # 取前两个最大值
+            level1_size = filtered_sizes[0][0]
+            level2_size = filtered_sizes[1][0]
+            return level1_size, level2_size
+    
+    def _identify_headings_with_thresholds(self, blocks: List[TextBlock], base_size: float,
+                                           level1_threshold: float, level2_threshold: float,
+                                           level2_as_body: bool = True, level3_as_body: bool = True) -> List[HeadingInfo]:
+        """使用确定的阈值识别标题
+        
+        Args:
+            level1_threshold: 一级标题字号阈值
+            level2_threshold: 二级标题字号阈值
+            level2_as_body: 是否将二级标题视为正文
+            level3_as_body: 是否将三级标题视为正文
+        """
+        headings = []
+        
+        for i, block in enumerate(blocks):
+            prev_block = blocks[i-1] if i > 0 else None
+            next_block = blocks[i+1] if i < len(blocks) - 1 else None
+            
+            # 获取该文本块后面紧跟的正文x0
+            body_x0 = self._get_body_x0_after(blocks, i, base_size)
+            
+            level = self._classify_block_with_thresholds(
+                block, base_size, body_x0, 
+                level1_threshold, level2_threshold,
+                prev_block, next_block
+            )
+            
+            if level > 0:
+                # 根据控制参数决定是否视为正文
+                is_body = False
+                if level == 2 and level2_as_body:
+                    is_body = True
+                elif level == 3 and level3_as_body:
+                    is_body = True
+                
+                headings.append(HeadingInfo(block=block, level=level, is_body=is_body))
+        
+        return headings
+    
+    def _classify_block_with_thresholds(self, block: TextBlock, base_size: float,
+                                        body_x0: Optional[float],
+                                        level1_threshold: float, level2_threshold: float,
+                                        prev_block: Optional[TextBlock] = None,
+                                        next_block: Optional[TextBlock] = None) -> int:
+        """使用阈值分类文本块
+        
+        返回标题层级（0=正文，1=一级，2=二级，3=三级）
+        """
+        text = block.text.strip()
+        if len(text) < 2:
+            return 0
+        
+        # 页眉页脚区域过滤
+        if len(text) < 30 and self._is_in_header_footer_area(block):
+            return 0
+        
+        # 标签过滤
+        if self._is_label(text):
+            return 0
+        
+        # 注释章节过滤
+        if self._is_note_heading(text):
+            return 0
+        
+        font_size = block.font_size
+        no_period = not block.ends_with_period
+        
+        # 获取行宽
+        line_width = block.page_width
+        
+        # 检测留白
+        has_large_margin = self._has_large_margin(block, prev_block, next_block, line_width)
+        
+        # 检测是否居中
+        is_centered = self._is_centered(block, block.page_width)
+        
+        # 判断一级标题：字号 >= level1_threshold + 垂直留白足够 + 短文本 + 无句号
+        has_vertical_margin_only = self._has_vertical_margin_only(block, prev_block, next_block)
+        if font_size >= level1_threshold - 0.5 and has_vertical_margin_only and len(text) < 50 and no_period:
+            return 1
+        
+        # 判断二级标题：字号 >= level2_threshold 且 < level1_threshold + 留白足够 + 短文本 + 无句号 + x0远离正文
+        if level2_threshold - 0.5 <= font_size < level1_threshold - 0.5 and has_large_margin and len(text) < 50 and no_period:
+            if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
+                return 2
+        
+        # 判断三级标题：字号 >= base_size 且 < level2_threshold + 留白足够 + 短文本 + 无句号 + x0接近正文
+        if base_size <= font_size < level2_threshold and has_large_margin and len(text) < 40 and no_period:
+            if body_x0 and abs(block.bbox[0] - body_x0) <= 10:
+                return 3
+        
+        return 0
     
     def _estimate_heading_level(self, font_ratio: float, text: str = "") -> int:
         """根据字号比例和文本内容估算标题层级
@@ -122,8 +354,14 @@ class PDFReader(FileReader):
         # 计算基准字号
         base_size = self._calculate_base_font_size(blocks)
         
-        # 识别标题（每个标题会使用自己后面紧跟的正文x0来判断）
-        headings = self._identify_headings(blocks, base_size, level2_as_body=level2_as_body, level3_as_body=level3_as_body)
+        # 第一步：收集所有标题候选并统计字号
+        heading_candidates = self._collect_heading_candidates(blocks, base_size)
+        
+        # 第二步：根据字号分布确定一级和二级标题阈值
+        level1_threshold, level2_threshold = self._calculate_heading_thresholds(heading_candidates, base_size)
+        
+        # 第三步：使用阈值重新识别标题
+        headings = self._identify_headings_with_thresholds(blocks, base_size, level1_threshold, level2_threshold, level2_as_body=level2_as_body, level3_as_body=level3_as_body)
         
         # 判断独立性
         headings = self._check_independence(headings, blocks, base_size)
@@ -231,71 +469,21 @@ class PDFReader(FileReader):
         
         return None
     
-    def _identify_headings(self, blocks: List[TextBlock], base_size: float,
-                          level2_as_body: bool = True, level3_as_body: bool = True) -> List[HeadingInfo]:
-        """识别所有标题
+    def _is_centered(self, block: TextBlock, page_width: float) -> bool:
+        """检查文本块是否居中"""
+        block_width = block.bbox[2] - block.bbox[0]
+        x0 = block.bbox[0]
+        x1 = block.bbox[2]
         
-        Args:
-            level2_as_body: 是否将二级标题视为正文（默认True）
-            level3_as_body: 是否将三级标题视为正文（默认True）
-        """
-        headings = []
+        # 计算左右边距
+        left_margin = x0
+        right_margin = page_width - x1
         
-        for i, block in enumerate(blocks):
-            prev_block = blocks[i-1] if i > 0 else None
-            next_block = blocks[i+1] if i < len(blocks) - 1 else None
-            
-            # 获取该文本块后面紧跟的正文x0
-            body_x0 = self._get_body_x0_after(blocks, i, base_size)
-            
-            level = self._classify_block(block, base_size, body_x0, prev_block, next_block)
-            if level > 0:
-                # 根据控制参数决定是否视为正文
-                is_body = False
-                if level == 2 and level2_as_body:
-                    is_body = True
-                elif level == 3 and level3_as_body:
-                    is_body = True
-                
-                headings.append(HeadingInfo(block=block, level=level, is_body=is_body))
-        
-        return headings
-    
-    def _classify_block(self, block: TextBlock, base_size: float, 
-                       body_x0: Optional[float],
-                       prev_block: Optional[TextBlock] = None,
-                       next_block: Optional[TextBlock] = None) -> int:
-        """分类文本块，返回标题层级（0=正文，1=一级，2=二级，3=三级）"""
-        text = block.text.strip()
-        if len(text) < 2:
-            return 0
-        
-        font_ratio = block.font_size / base_size if base_size > 0 else 1.0
-        no_period = not block.ends_with_period
-        
-        # 获取行宽
-        line_width = block.page_width
-        
-        # 检测留白
-        has_large_margin = self._has_large_margin(block, prev_block, next_block, line_width)
-        
-        # 判断一级标题：字号≥1.4 + 垂直留白足够 + 短文本 + 无句号 + x0远离正文
-        has_vertical_margin_only = self._has_vertical_margin_only(block, prev_block, next_block)
-        if font_ratio >= 1.4 and has_vertical_margin_only and len(text) < 50 and no_period:
-            if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
-                return 1
-        
-        # 判断二级标题：字号1.1-1.4 + 留白足够 + 短文本 + 无句号 + x0远离正文
-        if 1.1 <= font_ratio < 1.4 and has_large_margin and len(text) < 50 and no_period:
-            if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
-                return 2
-        
-        # 判断三级标题：字号1.0-1.4 + 留白足够 + 短文本 + 无句号 + x0接近正文
-        if 1.0 <= font_ratio < 1.4 and has_large_margin and len(text) < 40 and no_period:
-            if body_x0 and abs(block.bbox[0] - body_x0) <= 10:
-                return 3
-        
-        return 0
+        # 如果左右边距相差不超过20%，视为居中
+        if left_margin + right_margin > 0:
+            margin_diff_ratio = abs(left_margin - right_margin) / (left_margin + right_margin)
+            return margin_diff_ratio < 0.2
+        return False
     
     def _has_large_margin(self, block: TextBlock, prev_block: Optional[TextBlock], 
                           next_block: Optional[TextBlock], line_width: float) -> bool:
@@ -471,6 +659,49 @@ class PDFReader(FileReader):
         chapters = []
         block_indices = {id(b): i for i, b in enumerate(blocks)}
         
+        # 首先，直接在blocks列表中找出所有注释标题及其内容范围
+        # 注释标题包括："注释"、"注释 - 绪论"等
+        # 注意：注释标题可能被标记为is_body=True，所以需要在blocks中直接查找
+        note_ranges = []  # [(start_idx, end_idx), ...]
+        
+        i = 0
+        while i < len(blocks):
+            block = blocks[i]
+            text = block.text.strip()
+            
+            # 检查是否是注释标题
+            if self._is_note_heading(text):
+                note_start_idx = i
+                # 查找这个注释标题的结束位置
+                # 注释内容通常持续到文档结束，或遇到下一个一级/二级标题
+                note_end_idx = len(blocks) - 1
+                
+                for j in range(i + 1, len(blocks)):
+                    next_block = blocks[j]
+                    next_text = next_block.text.strip()
+                    
+                    # 如果遇到下一个非注释的一级标题，则注释结束
+                    # 一级标题的特征：字号较大、短文本、无句号
+                    font_ratio = next_block.font_size / base_size if base_size > 0 else 1.0
+                    is_short = len(next_text) < 50 and not next_text.endswith((".", "。", "!", "！", "?", "？"))
+                    is_large_font = font_ratio >= 1.4
+                    
+                    # 如果满足一级标题条件且不是注释标题，则注释结束
+                    if is_large_font and is_short and not self._is_note_heading(next_text):
+                        note_end_idx = j - 1
+                        break
+                
+                note_ranges.append((note_start_idx, note_end_idx))
+                i = note_end_idx + 1  # 跳过已处理的注释范围
+            else:
+                i += 1
+        
+        # 创建注释范围的快速查找集合
+        note_block_indices = set()
+        for start, end in note_ranges:
+            for idx in range(start, end + 1):
+                note_block_indices.add(idx)
+        
         for i, heading in enumerate(headings):
             if not heading.is_independent:
                 continue
@@ -479,16 +710,36 @@ class PDFReader(FileReader):
             if heading.is_body:
                 continue
             
+            # 检查是否为注释标题，如果是则跳过（不构建章节）
+            heading_text = heading.merged_title if heading.merged_title else heading.block.text
+            if self._is_note_heading(heading_text):
+                continue
+            
             start_idx = block_indices.get(id(heading.block), -1)
             if start_idx < 0:
                 continue
             
-            # 查找章节结束位置（遇到下一个不视为正文的标题）
+            # 检查当前标题是否在注释范围内（不应该发生，但以防万一）
+            if start_idx in note_block_indices:
+                continue
+            
+            # 查找章节结束位置（遇到下一个不视为正文的标题或注释标题）
             end_idx = len(blocks) - 1
+            
+            # 首先检查从start_idx之后是否有注释标题
+            for j in range(start_idx + 1, len(blocks)):
+                block = blocks[j]
+                text = block.text.strip()
+                if self._is_note_heading(text):
+                    end_idx = j - 1
+                    break
+            
+            # 然后在headings列表中查找下一个非正文标题
             for j in range(i + 1, len(headings)):
-                if not headings[j].is_body:
-                    next_idx = block_indices.get(id(headings[j].block), -1)
-                    if next_idx > 0:
+                next_heading = headings[j]
+                if not next_heading.is_body:
+                    next_idx = block_indices.get(id(next_heading.block), -1)
+                    if next_idx > 0 and next_idx - 1 < end_idx:
                         end_idx = next_idx - 1
                     break
             
@@ -501,6 +752,10 @@ class PDFReader(FileReader):
             
             for j in range(start_idx, min(end_idx + 1, len(blocks))):
                 block = blocks[j]
+                
+                # 跳过注释范围内的内容块
+                if j in note_block_indices:
+                    continue
                 
                 # 跳过标题本身（只保留文本）
                 if j == start_idx:
