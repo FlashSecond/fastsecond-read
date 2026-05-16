@@ -47,7 +47,7 @@ class EPUBReader(FileReader):
     MIN_SUBSTANTIAL_CHAPTER = 1000
     
     # 章节标题模式
-    CHAPTER_PATTERN = re.compile(r'第[一二三四五六七八九十百千\d]+章|Chapter\s*\d+|^\d+\s+', re.IGNORECASE)
+    CHAPTER_PATTERN = re.compile(r'第[一二三四五六七八九十百千\d]+[章讲]|Chapter\s*\d+|^\d+\s+', re.IGNORECASE)
     PART_PATTERN = re.compile(r'第[一二三四五六七八九十\d]+(部分|篇|卷|集|部)|Part\s*\d+|Volume\s*[\dIVX]+|Book\s*\d+', re.IGNORECASE)
     
     # CSS类名模式
@@ -167,9 +167,10 @@ class EPUBReader(FileReader):
         验证章节层级，区分真正章节和小节
         
         规则：
-        1. 优先匹配"第X章"或数字编号格式作为主章节
-        2. 无章节编号前缀的标题视为小节
-        3. 小于1000字的"章节"自动合并到上一章
+        1. 优先匹配"第X章/第X讲"或数字编号格式作为主章节
+        2. 通过HTML标签层级(h1/h2 vs h3+)区分主章节和小节
+        3. 无章节编号前缀的标题视为小节
+        4. 小于1000字的"章节"自动合并到上一章
         """
         if not chapters:
             return chapters
@@ -183,14 +184,27 @@ class EPUBReader(FileReader):
         for ch in sorted_chapters:
             title = ch.get('title', '')
             
+            # 获取HTML标签层级（如果有）
+            element = ch.get('element')
+            tag_level = 0
+            if element and hasattr(element, 'name'):
+                tag_name = element.name.lower()
+                if tag_name.startswith('h') and tag_name[1:].isdigit():
+                    tag_level = int(tag_name[1:])
+            
             # 检查是否是真正的章节标题
-            # 模式1: "第X章" 或 "Chapter X"
-            # 模式2: 数字编号开头，如 "01 标题" 或 "1. 标题"
+            # 模式1: "第X章/第X讲" 或 "Chapter X"
             is_real_chapter = bool(self.CHAPTER_PATTERN.search(title))
             
             # 额外检查：如果标题以数字+空格开头，也认为是章节
             if not is_real_chapter:
                 is_real_chapter = bool(re.match(r'^\d+[\.\s]', title))
+            
+            # 【关键修复】根据HTML标签层级调整判断
+            # h1/h2 作为主章节，h3+ 作为小节（即使匹配数字编号）
+            if is_real_chapter and tag_level >= 3:
+                # 虽然是数字编号，但是h3+标签，视为小节
+                is_real_chapter = False
             
             if is_real_chapter:
                 # 是真正的章节
@@ -213,7 +227,7 @@ class EPUBReader(FileReader):
         
         return validated
     
-    # ==================== 策略1: 标准标题标签 ====================
+    # ==================== 策略1: 标准标题标签（h1-h6）====================
     
     def _detect_by_headings(self, file_contents: Dict[str, str]) -> List[Dict]:
         """基于 h1-h6 标签检测"""
@@ -585,18 +599,73 @@ class EPUBReader(FileReader):
     def _build_file_contents_map(self, book) -> Dict[str, str]:
         """构建文件路径到内容的映射"""
         import ebooklib
+        import re
         file_contents = {}
         
         for item in book.get_items():
             if item.get_type() == ebooklib.ITEM_DOCUMENT:
                 name = item.get_name()
-                try:
-                    content = item.get_content().decode('utf-8')
+                content_bytes = item.get_content()
+                
+                # 尝试多种编码
+                content = None
+                used_encoding = None
+                for encoding in ['utf-8', 'gbk', 'gb2312', 'gb18030', 'big5']:
+                    try:
+                        content = content_bytes.decode(encoding)
+                        used_encoding = encoding
+                        break
+                    except:
+                        continue
+                
+                # 如果所有编码都失败，使用 utf-8 并忽略错误
+                if content is None:
+                    try:
+                        content = content_bytes.decode('utf-8', errors='ignore')
+                        used_encoding = 'utf-8-ignore'
+                    except:
+                        pass
+                
+                # 【编码修复】检测并修复 GBK 被错误解码为 UTF-8 的情况
+                if content and used_encoding == 'utf-8':
+                    content = self._fix_mojibake(content)
+                
+                if content:
                     file_contents[name] = content
-                except:
-                    pass
         
         return file_contents
+    
+    def _fix_mojibake(self, text: str) -> str:
+        """
+        修复 GBK 内容被错误解码为 UTF-8 产生的乱码（mojibake）
+        
+        原理：GBK 字节被错误地用 Latin-1 解码后，会产生特定的字符模式
+        例如：\xc4\xbf\xc2\xbc (GBK "目录") -> "Ŀ¼" (Latin-1 解码)
+        """
+        import re
+        
+        # 检测是否是乱码：包含大量拉丁扩展字符（GBK 被错误解码的特征）
+        # 这些字符在正确的中文文本中不应该大量出现
+        latin_extended_count = sum(1 for c in text if '\u0080' <= c <= '\u024f')
+        total_chars = len([c for c in text if c.isalpha()])
+        
+        if total_chars == 0:
+            return text
+        
+        # 如果超过 30% 的字符是拉丁扩展字符，可能是乱码
+        if latin_extended_count / total_chars < 0.3:
+            return text
+        
+        # 尝试修复：将文本编码回 latin-1，然后用 GBK 解码
+        try:
+            # 步骤1: 用 latin-1 编码（将字符还原为原始字节值）
+            bytes_data = text.encode('latin-1')
+            # 步骤2: 用 GBK 解码
+            fixed_text = bytes_data.decode('gbk')
+            return fixed_text
+        except:
+            # 修复失败，返回原文
+            return text
     
     def _build_chapters_from_detection(self, detected_chapters: List[Dict], file_contents: Dict[str, str]) -> List[Chapter]:
         """根据检测结果构建章节（支持跨文件内容提取和小节合并）"""
@@ -641,11 +710,12 @@ class EPUBReader(FileReader):
                                             current_idx: int, file_contents: Dict[str, str],
                                             file_order: Dict[str, int], sorted_files: List[str]) -> List[ContentBlock]:
         """
-        跨文件提取章节内容
+        跨文件提取章节内容，保留HTML标题层级结构
         
         EPUB中一个大章节可能跨多个HTML文件，需要：
         1. 从当前章节所在文件开始提取
         2. 继续提取后续文件，直到遇到下一个主章节或文件结束
+        3. 将h1-h6标签转换为Markdown标题层级
         """
         from bs4 import BeautifulSoup
         
@@ -661,13 +731,8 @@ class EPUBReader(FileReader):
                 next_chapter_file_idx = file_order.get(next_file, len(file_order))
                 break
         
-        # 收集所有小节标题（用于识别小节边界）
-        subsection_titles = set()
-        for j in range(current_idx + 1, len(all_chapters)):
-            if all_chapters[j].get('is_subsection', False):
-                subsection_titles.add(all_chapters[j]['title'])
-            else:
-                break
+        # 获取当前章节的标题，用于跳过重复的主标题
+        current_chapter_title = detected.get('title', '')
         
         # 遍历从当前文件到下一个主章节之前的所有文件
         for file_idx in range(start_file_idx, next_chapter_file_idx):
@@ -687,44 +752,59 @@ class EPUBReader(FileReader):
             # 提取正文内容
             body = soup.find('body')
             if body:
-                # 获取所有文本元素
-                for elem in body.find_all(['p', 'div', 'span', 'h1', 'h2', 'h3', 'h4']):
+                # 获取所有文本元素，保持原始顺序
+                for elem in body.find_all(['p', 'div', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
                     text = elem.get_text(strip=True)
-                    if not text or len(text) < 3:
+                    if not text or len(text) < 2:
                         continue
                     
-                    # 检查是否是小节标题
-                    if text in subsection_titles:
-                        # 添加小节标题作为二级标题
+                    # 跳过与当前章节标题完全相同的h1（避免重复）
+                    if elem.name == 'h1' and text == current_chapter_title:
+                        continue
+                    
+                    # 检测是否是标题（通过标签或CSS类）
+                    is_heading = False
+                    heading_level = 0
+                    
+                    # 1. 通过 h1-h6 标签判断
+                    if elem.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                        is_heading = True
+                        heading_level_map = {
+                            'h1': 2, 'h2': 3, 'h3': 4, 'h4': 5, 'h5': 6, 'h6': 6
+                        }
+                        heading_level = heading_level_map.get(elem.name, 2)
+                    
+                    # 2. 通过 CSS class 判断（处理没有使用 h1-h6 的EPUB）
+                    if not is_heading:
+                        elem_classes = elem.get('class', [])
+                        if isinstance(elem_classes, str):
+                            elem_classes = elem_classes.split()
+                        
+                        # 检查 class 名称判断层级
+                        cls_str = ' '.join(elem_classes).lower()
+                        
+                        # 小节标题特征：class 包含特定关键词
+                        if any(kw in cls_str for kw in ['firsttitle', 'chapter-title', 'section-title']):
+                            is_heading = True
+                            heading_level = 2  # 一级小节
+                        elif 'content_4' in cls_str or 'subtitle' in cls_str:
+                            # 检查是否包含加粗文本（小节标题常见模式）
+                            bold_span = elem.find('span', class_='bold')
+                            if bold_span or elem.find('b') or elem.find('strong'):
+                                is_heading = True
+                                heading_level = 3  # 二级小节
+                        elif 'content_5' in cls_str:
+                            is_heading = True
+                            heading_level = 4  # 三级小节
+                    
+                    if is_heading:
                         blocks.append(ContentBlock(
                             type=ContentType.HEADING,
-                            text=f"## {text}",
-                            level=2,
+                            text=text,
+                            level=heading_level,
                             style=TextStyle(),
                             page_number=0
                         ))
-                        subsection_titles.remove(text)  # 只处理一次
-                    elif elem.name in ['h1', 'h2', 'h3'] and len(text) < 100:
-                        # 可能是小节标题，检查是否匹配
-                        is_subsection = any(sub_title in text or text in sub_title 
-                                          for sub_title in subsection_titles)
-                        if is_subsection:
-                            blocks.append(ContentBlock(
-                                type=ContentType.HEADING,
-                                text=f"## {text}",
-                                level=2,
-                                style=TextStyle(),
-                                page_number=0
-                            ))
-                        else:
-                            # 普通段落
-                            blocks.append(ContentBlock(
-                                type=ContentType.PARAGRAPH,
-                                text=text,
-                                level=0,
-                                style=TextStyle(),
-                                page_number=0
-                            ))
                     else:
                         # 普通段落
                         blocks.append(ContentBlock(

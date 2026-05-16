@@ -112,7 +112,8 @@ def process_book(file_path: str, output_dir: Optional[str] = None) -> Dict:
         return {'success': False, 'error': f'文件不存在: {file_path}'}
     
     # 读取文件
-    print(f"[INFO] 读取文件: {file_path}")
+    safe_name = str(file_path).encode('ascii', 'ignore').decode('ascii')
+    print(f"[INFO] 读取文件: {safe_name}")
     document = ReaderFactory.read_file(str(file_path))
     
     if not document or not document.chapters:
@@ -175,7 +176,8 @@ def process_book(file_path: str, output_dir: Optional[str] = None) -> Dict:
     
     print(f"\n[INFO] 分章完成!")
     print(f"  章节数: {len(document.chapters)}")
-    print(f"  输出目录: {output_dir}")
+    safe_output = str(output_dir).encode('ascii', 'ignore').decode('ascii')
+    print(f"  输出目录: {safe_output}")
     print(f"  文件格式: Markdown (.md)")
     
     return {
@@ -217,7 +219,12 @@ def _mark_heading_level(block, text: str) -> str:
 
 def _sanitize_filename(name: str) -> str:
     """清理文件名中的非法字符"""
+    # 移除换行符和回车符
+    name = name.replace('\n', ' ').replace('\r', ' ')
+    # 替换Windows非法字符
     name = re.sub(r'[<>:"/\\|?*]', '_', name)
+    # 替换其他特殊字符
+    name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', name)
     name = name.strip('. ')
     if len(name) > 80:
         name = name[:80]

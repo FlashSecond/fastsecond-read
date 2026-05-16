@@ -7,20 +7,32 @@ PDF文件读取器 - 基于字号统计的智能分章
 2. 统计频率最高的字号作为正文基准字号
 3. 提取文本块：内容、坐标(x0,y0,x1,y1)、字体名、字体大小
 
-标题层级判定（基于字号统计阈值）：
-1. 收集所有可能的标题候选（字号>=基准）
-2. 统计候选标题的字号，去重
-3. 不放回取两次最大值：
-   - 第一个最大值 = 一级标题字号阈值
-   - 第二个最大值 = 二级标题字号阈值
-4. 根据阈值重新分类标题：
-   - 一级标题：字号 >= 一级阈值 + 垂直留白足够 + 短文本(<50字) + 无句号 + (居中 或 x0远离正文)
-   - 二级标题：字号 >= 二级阈值 且 < 一级阈值 + 留白足够 + 短文本(<50字) + 无句号 + x0远离正文
-   - 三级标题：字号 >= 基准 且 < 二级阈值 + 留白足够 + 短文本(<40字) + 无句号 + x0接近正文
+标题层级判定（自适应两轮检测算法）：
+
+第一轮：固定比率粗筛
+- 一级候选：字号 >= 基准 × 1.4
+- 二级候选：字号 > 基准 × 1.0 且 < 基准 × 1.4
+- 三级候选：字号 > 基准 × 1.0 且 < 基准 × 1.4
+- 收集所有候选字号，去重
+
+第二轮：自适应阈值计算
+- 对去重后的候选字号排序，取前两位最大字号
+- 计算自适应比率 = (第一大字号 + 第二大字号) / 2 / 基准字号
+
+第三轮：标题分类（使用自适应比率）
+- 一级标题：字号 >= 基准 × 自适应比率
+  + 垂直留白足够 + 无句号 + (居中 或 x0远离正文)
+- 二级标题：字号 > 基准 × 1.0 且 < 基准 × 自适应比率
+  + 留白足够 + 无句号 + x0远离正文
+- 三级标题：字号 > 基准 × 1.0 且 < 基准 × 自适应比率
+  + 留白足够 + 短文本(<50字) + 无句号 + x0接近正文
 
 关键区分点：
-- 一级/二级通过【字号绝对阈值】区分
-- 二级/三级通过【字号绝对阈值 + x0位置】区分
+- 一级：字号 >= 自适应比率（由前两位最大字号平均计算）
+- 二级/三级：字号范围相同（>1.0倍且<自适应比率），通过x0位置区分
+  - 二级：x0远离正文（>10点）
+  - 三级：x0接近正文（≤10点）
+- 字数限制：仅对三级标题生效（<50字），一级/二级标题无字数限制
 
 其他规则：
 - 留白检测：句前+句后留白 > 行宽一半，且垂直留白足够
@@ -134,8 +146,49 @@ class PDFReader(FileReader):
         
         return center_y < header_threshold or center_y > footer_threshold
     
+    def _is_header_footer_content(self, text: str) -> bool:
+        """检测文本是否为页眉页脚内容（基于内容特征）
+        
+        页眉页脚通常包含：
+        - 网址 (http://, https://, www.)
+        - 版权声明 (版权所有, 仅供学习, 严禁商业)
+        - 页码 (纯数字)
+        - 书名/章节名重复
+        """
+        text = text.strip()
+        if not text:
+            return False
+        
+        # 检测网址
+        if 'http://' in text or 'https://' in text or 'www.' in text:
+            return True
+        
+        # 检测版权相关关键词
+        copyright_keywords = ['版权所有', '仅供学习', '严禁商业', '不得转载', '翻版必究']
+        for keyword in copyright_keywords:
+            if keyword in text:
+                return True
+        
+        # 检测纯数字（页码）
+        if text.isdigit():
+            return True
+        
+        # 检测页码格式（如 "- 1 -" 或 "1 / 255"）
+        import re
+        if re.match(r'^[-\s]*\d+[-\s/]*$', text):
+            return True
+        
+        return False
+    
     def _collect_heading_candidates(self, blocks: List[TextBlock], base_size: float) -> List[Tuple[TextBlock, float]]:
-        """收集所有可能的标题候选（基于基本启发式规则）
+        """收集所有可能的标题候选（第一轮：固定比率粗筛）
+        
+        规则：
+        - 一级候选：字号 >= 基准 × 1.4
+        - 二级候选：字号 > 基准 × 1.0 且 < 基准 × 1.4
+        - 三级候选：字号 > 基准 × 1.0 且 < 基准 × 1.4
+        
+        注意：字数限制只在最终分类阶段对三级标题生效
         
         返回: [(block, font_ratio), ...]
         """
@@ -147,7 +200,7 @@ class PDFReader(FileReader):
             
             # 基本过滤：长度、位置
             text = block.text.strip()
-            if len(text) < 2 or len(text) > 50:  # 标题通常较短
+            if len(text) < 2:  # 至少2个字符
                 continue
             
             # 页眉页脚区域过滤
@@ -165,13 +218,21 @@ class PDFReader(FileReader):
             # 计算字号比例
             font_ratio = block.font_size / base_size if base_size > 0 else 1.0
             
-            # 只收集字号明显大于正文的候选（至少1.1倍）
-            if font_ratio < 1.1:
+            # 第一轮固定比率粗筛：
+            # 一级候选：>= 1.4倍（放宽留白检测，使用容差避免浮点精度问题）
+            # 二级/三级候选：> 1.0倍 且 < 1.4倍（严格留白检测）
+            if font_ratio <= 1.0:  # 必须大于1.0倍
                 continue
             
-            # 留白检测：标题通常有足够的留白
+            # 留白检测：根据字号比例使用不同标准
             line_width = block.page_width
-            has_margin = self._has_large_margin(block, prev_block, next_block, line_width)
+            if font_ratio >= 1.39:  # 使用1.39作为阈值，避免浮点精度问题（如20.999998/15.0=1.399999...）
+                # 一级候选：只需垂直留白足够
+                has_margin = self._has_vertical_margin_only(block, prev_block, next_block)
+            else:
+                # 二级/三级候选：需要水平和垂直留白都足够
+                has_margin = self._has_large_margin(block, prev_block, next_block, line_width)
+            
             if not has_margin:
                 continue
             
@@ -180,50 +241,59 @@ class PDFReader(FileReader):
         return candidates
     
     def _calculate_heading_thresholds(self, candidates: List[Tuple[TextBlock, float]], base_size: float) -> Tuple[float, float]:
-        """计算一级和二级标题的字号阈值
+        """计算自适应字号阈值（第二轮：自适应阈值计算）
         
         规则：
-        1. 统计所有候选标题的字号，按字号分组统计出现频率
-        2. 过滤掉出现频率过低的字号（可能是广告/噪音）
-        3. 不放回取两次最大值
-        4. 第一个最大值 = 一级标题字号
-        5. 第二个最大值 = 二级标题字号
+        1. 统计候选标题字号的频率（不去重，每个候选都计数）
+        2. 去掉频率最高的字号（通常是正文基准字号）
+        3. 计算剩余字号的期望值作为自适应比率
+        4. 一级阈值 = 期望值
+        5. 二级阈值 = 期望值 × 0.8（如果没有则使用基准×1.1）
         
         返回: (level1_threshold, level2_threshold)
         """
         if not candidates:
-            # 默认值：一级1.5倍，二级1.2倍
-            return base_size * 1.5, base_size * 1.2
+            # 默认值：一级1.4倍，二级1.1倍
+            return base_size * 1.4, base_size * 1.1
         
-        # 按字号分组统计出现频率（保留1位小数）
+        # 统计字号频率（不去重，每个候选都计数）
         from collections import Counter
         size_counter = Counter()
         for block, ratio in candidates:
-            size_rounded = round(block.font_size, 1)
-            size_counter[size_rounded] += 1
+            # 使用原始字号，不四舍五入，保持精度
+            size_counter[block.font_size] += 1
         
-        # 过滤掉出现频率过低的字号（少于2次的可能是广告/噪音）
-        min_frequency = 2
-        filtered_sizes = [(size, count) for size, count in size_counter.items() if count >= min_frequency]
+        if len(size_counter) == 0:
+            return base_size * 1.4, base_size * 1.1
         
-        if not filtered_sizes:
-            # 如果没有满足频率要求的，使用原始逻辑
-            font_sizes = set(round(block.font_size, 1) for block, ratio in candidates)
-            filtered_sizes = [(size, 1) for size in font_sizes]
+        # 找出频率最高的字号（通常是正文基准字号）
+        max_freq_size = max(size_counter.keys(), key=lambda s: size_counter[s])
+        max_freq = size_counter[max_freq_size]
         
-        # 按字号降序排序
-        filtered_sizes.sort(key=lambda x: x[0], reverse=True)
+        # 去掉频率最高的字号，计算剩余字号的期望值（加权平均）
+        remaining_sizes = []
+        total_weight = 0
+        weighted_sum = 0.0
         
-        if len(filtered_sizes) == 0:
-            return base_size * 1.5, base_size * 1.2
-        elif len(filtered_sizes) == 1:
-            # 只有一个字号级别
-            return filtered_sizes[0][0], base_size * 1.2
-        else:
-            # 取前两个最大值
-            level1_size = filtered_sizes[0][0]
-            level2_size = filtered_sizes[1][0]
-            return level1_size, level2_size
+        for size, freq in size_counter.items():
+            if size != max_freq_size:  # 去掉频率最高的字号
+                remaining_sizes.append(size)
+                weighted_sum += size * freq
+                total_weight += freq
+        
+        # 如果没有剩余字号，使用默认阈值
+        if total_weight == 0:
+            return base_size * 1.4, base_size * 1.1
+        
+        # 计算期望值（加权平均）
+        expected_size = weighted_sum / total_weight
+        
+        # 一级阈值 = 期望值
+        level1_threshold = expected_size
+        # 二级阈值 = 期望值的80%（或基准×1.1，取较大者）
+        level2_threshold = max(expected_size * 0.8, base_size * 1.1)
+        
+        return level1_threshold, level2_threshold
     
     def _identify_headings_with_thresholds(self, blocks: List[TextBlock], base_size: float,
                                            level1_threshold: float, level2_threshold: float,
@@ -300,25 +370,36 @@ class PDFReader(FileReader):
         # 检测是否居中
         is_centered = self._is_centered(block, block.page_width)
         
-        # 判断一级标题：字号 >= level1_threshold + 垂直留白足够 + 短文本 + 无句号
+        # 第三轮：标题分类（使用自适应比率）
+        # 使用更小的容差（1%或0.2），避免阈值接近时重叠
+        tolerance = min(0.2, level1_threshold * 0.01)
+        
+        # 判断一级标题：字号 >= level1_threshold + 垂直留白足够 + 无句号
+        # 一级标题无字数限制
         has_vertical_margin_only = self._has_vertical_margin_only(block, prev_block, next_block)
-        if font_size >= level1_threshold - 0.5 and has_vertical_margin_only and len(text) < 50 and no_period:
+        if font_size >= level1_threshold - tolerance and has_vertical_margin_only and no_period:
             return 1
         
-        # 判断二级标题：字号 >= level2_threshold 且 < level1_threshold + 留白足够 + 短文本 + 无句号 + x0远离正文
-        if level2_threshold - 0.5 <= font_size < level1_threshold - 0.5 and has_large_margin and len(text) < 50 and no_period:
+        # 判断二级/三级标题：字号 > base_size 且 < level1_threshold
+        # 二级和三级字号范围相同，通过x0位置区分
+        if base_size < font_size < level1_threshold - tolerance and has_large_margin and no_period:
+            # x0远离正文 (>10点) = 二级
+            # 二级标题无字数限制
             if not (body_x0 and abs(block.bbox[0] - body_x0) <= 10):
                 return 2
-        
-        # 判断三级标题：字号 >= base_size 且 < level2_threshold + 留白足够 + 短文本 + 无句号 + x0接近正文
-        if base_size <= font_size < level2_threshold and has_large_margin and len(text) < 40 and no_period:
-            if body_x0 and abs(block.bbox[0] - body_x0) <= 10:
-                return 3
+            # x0接近正文 (<=10点) = 三级
+            else:
+                # 三级标题字数限制：<50字（仅对三级标题生效）
+                if len(text) < 50:
+                    return 3
         
         return 0
     
     def _estimate_heading_level(self, font_ratio: float, text: str = "") -> int:
         """根据字号比例和文本内容估算标题层级
+        
+        注意：此函数仅用于在_build_chapters中对未识别的标题进行估算。
+        由于此时正文已经被过滤掉，这里的"标题"实际上是相对正文较大的文本。
         
         Args:
             font_ratio: 字号与基准字号的比例
@@ -327,23 +408,270 @@ class PDFReader(FileReader):
         Returns:
             估算的标题层级 (1-3)
         """
-        # 常规判断（不再使用三级标题模式匹配）
+        # 提高阈值，避免小节标题被误判为章节标题
+        # 基准字号14.8，倍率1.4=20.7，1.25=18.5，1.15=17.0
         if font_ratio >= 1.4:
-            return 1  # 一级标题
-        elif font_ratio >= 1.1:
-            return 2  # 二级标题
-        elif font_ratio >= 1.0:
-            return 3  # 三级标题（上限改为1.4，与二级标题上限一致）
+            return 1  # 一级标题（字号显著大于正文）
+        elif font_ratio >= 1.25:
+            return 2  # 二级标题（字号明显大于正文）
+        elif font_ratio >= 1.15:
+            return 3  # 三级标题（字号略大于正文）
         else:
-            return 2  # 默认二级
+            return 0  # 视为正文（字号接近基准）
     
-    def read(self, file_path: str, level2_as_body: bool = True, level3_as_body: bool = True) -> Document:
+    def _extract_toc_structure(self, blocks: List[TextBlock]) -> List[Dict]:
+        """从PDF目录页提取章节结构
+        
+        检测目录页（通常包含"目录"标题和章节列表），提取章节标题和层级关系。
+        
+        Returns:
+            章节结构列表，每项包含：
+            - title: 章节标题
+            - level: 层级（1=章，2=节）
+            - type: 类型（'part'=篇，'chapter'=章，'section'=节）
+            - parent: 父章节标题（如果有）
+        """
+        toc_items = []
+        current_part = None
+        toc_start_page = None
+        pages_processed = set()  # 已处理的页码
+        
+        for b in blocks:
+            text = b.text.strip()
+            
+            # 检测目录开始（"目录"标题，大字号）
+            if toc_start_page is None and text == "目录" and b.font_size >= 20:
+                toc_start_page = b.page_num
+                pages_processed.add(b.page_num)
+                continue
+            
+            # 如果还没找到目录开始，跳过
+            if toc_start_page is None:
+                continue
+            
+            # 严格限制：目录最多2页（目录标题页 + 1页内容）
+            if len(pages_processed) >= 2 and b.page_num not in pages_processed:
+                break
+            
+            # 记录当前页
+            pages_processed.add(b.page_num)
+            
+            # 如果页码跳跃超过1页，说明目录结束
+            if b.page_num > toc_start_page + 1:
+                break
+            
+            # 跳过空文本和"目录"本身
+            if not text or text == "目录":
+                continue
+            
+            # 过滤过长的文本（不是标题）- 目录中的标题通常较短
+            if len(text) >= 50:
+                continue
+            
+            # 根据字号判断层级（目录中的标题通常字号较大且一致）
+            if b.font_size >= 19.0:  # 一级标题（章/篇）
+                if "第" in text and "篇" in text:
+                    current_part = text
+                    toc_items.append({
+                        'title': text,
+                        'level': 1,
+                        'type': 'part',
+                        'parent': None
+                    })
+                else:
+                    toc_items.append({
+                        'title': text,
+                        'level': 1,
+                        'type': 'chapter',
+                        'parent': current_part
+                    })
+            elif b.font_size >= 14.0:  # 二级标题（节）
+                toc_items.append({
+                    'title': text,
+                    'level': 2,
+                    'type': 'section',
+                    'parent': current_part
+                })
+        
+        return toc_items
+    
+    def _find_toc_in_content(self, toc_items: List[Dict], blocks: List[TextBlock]) -> List[Dict]:
+        """在正文中查找目录标题的位置
+        
+        对于每个目录中的标题，在正文中查找其首次出现的位置。
+        支持标题被分成多个文本块的情况（如"三大宗："和"酒精、烟草、咖啡因"）。
+        过滤掉位置不合理的匹配（如出现在文档末尾的可能是注释）。
+        
+        Returns:
+            添加了'found', 'index', 'page'字段的toc_items
+        """
+        # 找到正文开始的位置
+        content_start_page = 1
+        toc_start_page = None
+        for b in blocks:
+            if b.text.strip() == "目录" and b.font_size >= 20:
+                toc_start_page = b.page_num
+                break
+        
+        if toc_start_page:
+            # 正文从目录开始页 + 2 开始（跳过目录标题页和目录内容页）
+            content_start_page = toc_start_page + 2
+        
+        for idx, item in enumerate(toc_items):
+            title = item['title']
+            found = False
+            
+            for i, b in enumerate(blocks):
+                # 跳过目录页（严格限制）
+                if b.page_num < content_start_page:
+                    continue
+                
+                # 尝试完全匹配
+                if b.text.strip() == title:
+                    doc_progress = i / len(blocks)
+                    
+                    if item['type'] == 'part':
+                        break
+                    elif item['type'] == 'chapter':
+                        item['found'] = True
+                        item['index'] = i
+                        item['page'] = b.page_num
+                        found = True
+                        break
+                    else:  # section
+                        if doc_progress < 0.95:
+                            item['found'] = True
+                            item['index'] = i
+                            item['page'] = b.page_num
+                            found = True
+                            break
+                
+                # 尝试部分匹配（标题可能被分成多个块）
+                # 检查当前块是否包含标题的开头部分
+                elif title.startswith(b.text.strip()) and len(b.text.strip()) >= 3:
+                    # 可能是标题的第一部分，检查接下来的几个块
+                    combined_text = b.text.strip()
+                    combined_idx = i
+                    for j in range(i + 1, min(i + 5, len(blocks))):
+                        if blocks[j].page_num != b.page_num:
+                            break  # 跨页了，停止组合
+                        combined_text += blocks[j].text.strip()
+                        # 使用归一化比较（忽略空格差异）
+                        normalized_combined = combined_text.replace(" ", "").replace("\u3000", "")
+                        normalized_title = title.replace(" ", "").replace("\u3000", "")
+                        if normalized_combined == normalized_title or normalized_title in normalized_combined:
+                            doc_progress = i / len(blocks)
+                            
+                            if item['type'] == 'part':
+                                break
+                            elif item['type'] == 'chapter':
+                                item['found'] = True
+                                item['index'] = combined_idx
+                                item['page'] = b.page_num
+                                found = True
+                                break
+                            else:  # section
+                                if doc_progress < 0.95:
+                                    item['found'] = True
+                                    item['index'] = combined_idx
+                                    item['page'] = b.page_num
+                                    found = True
+                                    break
+                    
+                    if found:
+                        break
+            
+            if not found:
+                item['found'] = False
+        
+        return toc_items
+    
+    def _build_chapters_from_toc(self, toc_items: List[Dict], blocks: List[TextBlock], 
+                                  base_size: float) -> List[Chapter]:
+        """基于目录结构构建章节
+        
+        只使用在正文中找到的目录标题作为分章依据。
+        """
+        chapters = []
+        found_items = [item for item in toc_items if item.get('found') and item['type'] != 'part']
+        
+        for i, item in enumerate(found_items):
+            title = item['title']
+            start_idx = item['index']
+            level = item['level']
+            
+            # 计算章节结束位置
+            if i + 1 < len(found_items):
+                end_idx = found_items[i + 1]['index']
+            else:
+                end_idx = len(blocks)
+            
+            # 提取内容块
+            content_blocks = []
+            chapter_text = ""
+            
+            for j in range(start_idx, min(end_idx, len(blocks))):
+                block = blocks[j]
+                
+                # 跳过标题本身（只保留文本）
+                if j == start_idx:
+                    chapter_text += block.text + "\n\n"
+                    continue
+                
+                # 判断内容类型
+                font_ratio = block.font_size / base_size if base_size > 0 else 1.0
+                is_body_text = (0.9 <= font_ratio <= 1.1) or block.ends_with_period
+                
+                if is_body_text:
+                    content_type = ContentType.PARAGRAPH
+                    content_level = 0
+                else:
+                    # 可能是子标题，估算层级
+                    if font_ratio >= 1.4:
+                        content_type = ContentType.HEADING
+                        content_level = 1
+                    elif font_ratio >= 1.25:
+                        content_type = ContentType.HEADING
+                        content_level = 2
+                    elif font_ratio >= 1.15:
+                        content_type = ContentType.HEADING
+                        content_level = 3
+                    else:
+                        content_type = ContentType.PARAGRAPH
+                        content_level = 0
+                
+                content_blocks.append(ContentBlock(
+                    type=content_type,
+                    text=block.text,
+                    level=content_level,
+                    style=TextStyle(
+                        font_size=block.font_size,
+                        bold=False
+                    )
+                ))
+                
+                chapter_text += block.text + "\n\n"
+            
+            chapters.append(Chapter(
+                index=len(chapters) + 1,
+                title=title,
+                level=level,
+                content_blocks=content_blocks,
+                word_count=len(chapter_text.replace(" ", "").replace("\n", "")),
+                paragraph_count=len([b for b in content_blocks if b.type == ContentType.PARAGRAPH])
+            ))
+        
+        return chapters
+    
+    def read(self, file_path: str, level2_as_body: bool = True, level3_as_body: bool = True,
+             use_toc: bool = True) -> Document:
         """读取PDF文件
         
         Args:
             file_path: PDF文件路径
-            level2_as_body: 是否将二级标题视为正文（默认True）
-            level3_as_body: 是否将三级标题视为正文（默认True）
+            level2_as_body: 是否将二级标题视为正文（默认True，仅当use_toc=False时生效）
+            level3_as_body: 是否将三级标题视为正文（默认True，仅当use_toc=False时生效）
+            use_toc: 是否优先使用目录结构分章（默认True）
         """
         path = Path(file_path)
         doc = fitz.open(file_path)
@@ -354,23 +682,47 @@ class PDFReader(FileReader):
         # 计算基准字号
         base_size = self._calculate_base_font_size(blocks)
         
-        # 第一步：收集所有标题候选并统计字号
-        heading_candidates = self._collect_heading_candidates(blocks, base_size)
+        chapters = []
+        used_toc = False
         
-        # 第二步：根据字号分布确定一级和二级标题阈值
-        level1_threshold, level2_threshold = self._calculate_heading_thresholds(heading_candidates, base_size)
+        # 尝试使用目录结构分章
+        if use_toc:
+            try:
+                # 提取目录结构
+                toc_items = self._extract_toc_structure(blocks)
+                
+                if toc_items:
+                    # 在正文中查找目录标题
+                    toc_items = self._find_toc_in_content(toc_items, blocks)
+                    found_count = sum(1 for item in toc_items if item.get('found'))
+                    
+                    # 如果找到足够多的章节（至少3个），使用目录分章
+                    if found_count >= 3:
+                        chapters = self._build_chapters_from_toc(toc_items, blocks, base_size)
+                        used_toc = True
+            except Exception:
+                # 目录分章失败，回退到字号阈值方法
+                pass
         
-        # 第三步：使用阈值重新识别标题
-        headings = self._identify_headings_with_thresholds(blocks, base_size, level1_threshold, level2_threshold, level2_as_body=level2_as_body, level3_as_body=level3_as_body)
-        
-        # 判断独立性
-        headings = self._check_independence(headings, blocks, base_size)
-        
-        # 合并非独立标题
-        headings = self._merge_headings(headings)
-        
-        # 构建章节
-        chapters = self._build_chapters(headings, blocks, base_size)
+        # 如果目录分章未使用或失败，使用传统的字号阈值方法
+        if not chapters:
+            # 第一步：收集所有标题候选并统计字号
+            heading_candidates = self._collect_heading_candidates(blocks, base_size)
+            
+            # 第二步：根据字号分布确定一级和二级标题阈值
+            level1_threshold, level2_threshold = self._calculate_heading_thresholds(heading_candidates, base_size)
+            
+            # 第三步：使用阈值重新识别标题
+            headings = self._identify_headings_with_thresholds(blocks, base_size, level1_threshold, level2_threshold, level2_as_body=level2_as_body, level3_as_body=level3_as_body)
+            
+            # 判断独立性
+            headings = self._check_independence(headings, blocks, base_size)
+            
+            # 合并非独立标题
+            headings = self._merge_headings(headings)
+            
+            # 构建章节
+            chapters = self._build_chapters(headings, blocks, base_size)
         
         # 计算总字数
         total_words = sum(ch.word_count for ch in chapters)
@@ -386,7 +738,8 @@ class PDFReader(FileReader):
             metadata={
                 "base_font_size": base_size,
                 "level2_as_body": level2_as_body,
-                "level3_as_body": level3_as_body
+                "level3_as_body": level3_as_body,
+                "used_toc": used_toc
             }
         )
     
@@ -525,8 +878,8 @@ class PDFReader(FileReader):
         if next_block and next_block.page_num == block.page_num:
             margin_bottom = next_block.bbox[1] - block.bbox[3]
         
-        # 上方或下方留白超过行高
-        return (margin_top > line_height) or (margin_bottom > line_height)
+        # 上方或下方留白超过行高的0.5倍（放宽条件，适应章标题紧凑排版）
+        return (margin_top > line_height * 0.5) or (margin_bottom > line_height * 0.5)
     
     def _check_independence(self, headings: List[HeadingInfo], 
                            blocks: List[TextBlock], base_size: float) -> List[HeadingInfo]:
@@ -757,6 +1110,15 @@ class PDFReader(FileReader):
                 if j in note_block_indices:
                     continue
                 
+                # 跳过页眉页脚区域的内容
+                text = block.text.strip()
+                # 条件1：短文本在页眉页脚区域内
+                if len(text) < 30 and self._is_in_header_footer_area(block):
+                    continue
+                # 条件2：包含网址或版权信息的文本（无论长度）
+                if self._is_header_footer_content(text):
+                    continue
+                
                 # 跳过标题本身（只保留文本）
                 if j == start_idx:
                     chapter_text += block.text + "\n\n"
@@ -772,15 +1134,21 @@ class PDFReader(FileReader):
                 else:
                     # 判断是否为正文
                     font_ratio = block.font_size / base_size if base_size > 0 else 1.0
-                    is_body = (0.9 <= font_ratio <= 1.1) or block.ends_with_period
+                    is_body_text = (0.9 <= font_ratio <= 1.1) or block.ends_with_period
                     
-                    if is_body:
+                    if is_body_text:
                         content_type = ContentType.PARAGRAPH
                         content_level = 0
                     else:
                         # 可能是未识别的标题，根据字号和文本内容估算层级
-                        content_type = ContentType.HEADING
-                        content_level = self._estimate_heading_level(font_ratio, block.text)
+                        estimated_level = self._estimate_heading_level(font_ratio, block.text)
+                        if estimated_level == 0:
+                            # 字号接近基准，视为正文
+                            content_type = ContentType.PARAGRAPH
+                            content_level = 0
+                        else:
+                            content_type = ContentType.HEADING
+                            content_level = estimated_level
                 
                 content_blocks.append(ContentBlock(
                     type=content_type,

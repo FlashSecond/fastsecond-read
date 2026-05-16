@@ -1,13 +1,13 @@
-# FastSecond-Read 智能书籍阅读与分析工具
+# FastSecond Read - 智能书籍分章工具
 
-> 智能分章节、提取内容、生成深度AI分析
+> 智能分章节、提取内容，支持 PDF、EPUB、Word 等 20+ 种格式
 
 ## 功能特性
 
-- **智能分章**: 自动识别书籍章节结构，按序号分文件夹存储
-- **多格式支持**: 支持 PDF、EPUB、DOCX、Markdown、TXT、HTML 等格式
-- **AI深度分析**: 为每章生成六维深度分析（概述、论点、概念、案例、框架、批判思考）
-- **批量处理**: 支持批量处理多本书籍
+- **智能分章**: 自动识别书籍章节结构，按层级分文件夹存储
+- **多格式支持**: 支持 PDF、EPUB、DOCX、Markdown、TXT、HTML 等 20+ 种格式
+- **Markdown 输出**: 每个章节保存为排版好的 Markdown 文件
+- **层级标记**: 使用标准 `#` 标记标识标题层级
 - **可扩展架构**: 模块化设计，易于添加新的读取器
 
 ## 支持的文件格式
@@ -39,18 +39,13 @@ pip install -r requirements.txt
 
 ```bash
 # 处理单本书籍
-python scripts/book_processor.py --input "书籍.pdf" --output "./output"
+python scripts/book_processor.py "书籍.pdf"
 
-# 批量处理
-python scripts/book_processor.py --input "./books/" --output "./output" --batch
+# 指定输出目录
+python scripts/book_processor.py "书籍.pdf" "D:/我的总结"
 ```
 
-### 3. 生成AI分析
 
-```bash
-# 为分章后的书籍生成AI深度分析
-python scripts/ai_analyze_chapters.py --book-dir "./output/书籍名"
-```
 
 ## 目录结构
 
@@ -58,7 +53,7 @@ python scripts/ai_analyze_chapters.py --book-dir "./output/书籍名"
 fastsecond-read/
 ├── scripts/
 │   ├── book_processor.py          # 书籍处理主脚本
-│   ├── ai_analyze_chapters.py     # AI深度分析脚本
+│   ├── ai_analyze_chapters.py     # AI分析提示词生成脚本
 │   ├── core/
 │   │   └── document.py             # 文档处理核心模块
 │   └── readers/
@@ -70,96 +65,87 @@ fastsecond-read/
 │       └── ...                     # 其他格式读取器
 ├── requirements.txt                # Python依赖
 ├── README.md                       # 本文件
-└── SKILL.md                        # 技能详细文档
+├── SKILL.md                        # 技能详细文档
+├── PDF_RULES.md                    # PDF/EPUB分章规则详解
+└── MEMORY.md                       # 更新历史
 ```
-
-## AI深度分析维度
-
-每章生成以下六维分析：
-
-1. **章节概述** - 核心内容摘要
-2. **核心论点解析** - 主要观点深度解读
-3. **关键概念与术语** - 重要概念解释
-4. **案例分析** - 案例深度剖析
-5. **理论框架与论证逻辑** - 理论结构分析
-6. **批判性思考** - 多角度批判分析
 
 ## 输出格式
 
 ### 分章输出
 
 ```
-output/
-└── 书籍名/
-    ├── 01_第一章标题/
-    │   ├── 01_第一章标题.md          # 章节原文
-    │   └── 01_第一章标题_AI深度分析.md  # AI分析
-    ├── 02_第二章标题/
-    │   ├── 02_第二章标题.md
-    │   └── 02_第二章标题_AI深度分析.md
-    └── ...
+书籍总结/我的书/
+├── 01_第1章_标题.md              # 一级标题（章）
+├── 01_1_第1节_标题.md            # 二级标题（节）
+├── 01_1_1_第1小节_标题.md        # 三级标题（小节）
+├── 02_第2章_标题.md
+└── ...
 ```
 
-### AI分析文件格式
+### 文件内容格式
 
 ```markdown
-# 第一章标题 - AI深度分析
+# 第1章 标题
 
-## 一、章节概述
-...
+---
 
-## 二、核心论点解析
-...
+**章节序号**：第1章  
+**章节层级**：1 【章】  
+**层级路径**：1  
+**字数统计**：3500 字  
+**生成时间**：2026-05-16 11:30  
 
-## 三、关键概念与术语
-...
+---
 
-## 四、案例分析
-...
+## 第一节 小节标题
 
-## 五、理论框架与论证逻辑
-...
+正文内容...
 
-## 六、批判性思考
-...
+### 一、要点标题
 
-## 七、思维导图
-```mermaid
-...
-```
+详细内容...
 
-## 九、知识提问
-...
+---
+
+*由 FastSecond Read 自动生成*
 ```
 
 ## 配置选项
 
-### 环境变量
+### 控制参数
 
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `OPENAI_API_KEY` | OpenAI API密钥 | - |
-| `OPENAI_BASE_URL` | API基础URL | https://api.openai.com |
-| `DEFAULT_MODEL` | 默认AI模型 | gpt-4 |
+```python
+# PDF/EPUB 读取器支持以下参数
+reader.read(file_path, level2_as_body=True, level3_as_body=True)
+```
 
-### 命令行参数
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `level2_as_body` | True | 二级标题视为正文（不创建独立章节） |
+| `level3_as_body` | True | 三级标题视为正文（不创建独立章节） |
 
-#### book_processor.py
+## 分章规则
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `--input`, `-i` | 输入文件或目录 | `--input "book.pdf"` |
-| `--output`, `-o` | 输出目录 | `--output "./output"` |
-| `--batch`, `-b` | 批量模式 | `--batch` |
-| `--format`, `-f` | 输出格式 | `--format md` |
+### PDF 分章规则
 
-#### ai_analyze_chapters.py
+使用**自适应两轮检测算法**：
 
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `--book-dir`, `-d` | 书籍目录 | `--book-dir "./output/书籍名"` |
-| `--chapters`, `-c` | 指定章节 | `--chapters 1,2,3` |
-| `--model`, `-m` | AI模型 | `--model gpt-4` |
+1. **第一轮**：固定比率粗筛（一级≥1.4倍，二级/三级>1.0且<1.4倍）
+2. **第二轮**：自适应阈值计算（取前两位最大字号平均）
+3. **第三轮**：标题分类（一级≥自适应比率，二级/三级通过x0位置区分）
+
+**字数限制规则**（2026-05-16更新）：
+- 一级/二级标题：无字数限制
+- 三级标题：< 50字（仅对三级标题生效）
+
+### EPUB 分章规则
+
+- **h1**: 一级标题
+- **h2**: 二级标题（默认为是正文）
+- **h3-h6**: 三级标题（默认为是正文）
+
+详细规则参见 `PDF_RULES.md`
 
 ## 扩展开发
 
@@ -182,17 +168,6 @@ class MyFormatReader(BaseReader):
         return content
 ```
 
-## 常见问题
-
-### Q: 如何处理扫描版PDF？
-A: 使用 OCR 读取器，需要安装 Tesseract OCR 引擎。
-
-### Q: 支持哪些AI模型？
-A: 支持所有 OpenAI 兼容的 API，包括 GPT-4、GPT-3.5、Claude 等。
-
-### Q: 如何调整分析深度？
-A: 修改 `ai_analyze_chapters.py` 中的提示词模板。
-
 ## 依赖要求
 
 - Python 3.8+
@@ -201,18 +176,6 @@ A: 修改 `ai_analyze_chapters.py` 中的提示词模板。
 ## 许可证
 
 MIT License
-
-## 贡献指南
-
-欢迎提交 Issue 和 Pull Request！
-
-## 更新日志
-
-### v1.0.0 (2026-05-06)
-- ✅ 初始版本发布
-- ✅ 支持15种文件格式
-- ✅ 实现AI深度分析功能
-- ✅ 清理临时脚本，优化代码结构
 
 ---
 
